@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/tomlext"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/log"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -41,7 +42,7 @@ type Config struct {
 
 func init() {
 	registry.Register(&plugin.Registration{
-		Type: plugins.InternalPlugin,
+		Type: plugins.ContainerMonitorPlugin,
 		Requires: []plugin.Type{
 			plugins.EventPlugin,
 			plugins.ServicePlugin,
@@ -61,6 +62,19 @@ func init() {
 			}
 			go m.run(tomlext.ToStdTime(ic.Config.(*Config).Interval))
 			return m, nil
+		},
+		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]interface{}) error {
+			if configVersion >= version.ConfigVersion {
+				return nil
+			}
+			const pluginName = string(plugins.InternalPlugin) + ".restart"
+			c, ok := pluginConfigs[pluginName]
+			if ok {
+				pluginConfigs[string(plugins.ContainerMonitorPlugin)+".restart"] = c
+				delete(pluginConfigs, pluginName)
+			}
+
+			return nil
 		},
 	})
 }
@@ -92,7 +106,6 @@ func (m *monitor) reconcile(ctx context.Context) error {
 	}
 	var wgNSLoop sync.WaitGroup
 	for _, name := range ns {
-		name := name
 		wgNSLoop.Add(1)
 		go func() {
 			defer wgNSLoop.Done()
@@ -104,7 +117,6 @@ func (m *monitor) reconcile(ctx context.Context) error {
 			}
 			var wgChangesLoop sync.WaitGroup
 			for _, c := range changes {
-				c := c
 				wgChangesLoop.Add(1)
 				go func() {
 					defer wgChangesLoop.Done()

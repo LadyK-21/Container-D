@@ -30,6 +30,7 @@ import (
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+	crierrors "k8s.io/cri-api/pkg/errors"
 
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -38,8 +39,7 @@ import (
 	"github.com/containerd/log"
 )
 
-// WithMounts sorts and adds runtime and CRI mounts to the spec
-func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*runtime.Mount, mountLabel string) oci.SpecOpts {
+func withMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*runtime.Mount, mountLabel string, handler *runtime.RuntimeHandler, cgroupWritable bool) oci.SpecOpts {
 	return func(ctx context.Context, client oci.Client, _ *containers.Container, s *runtimespec.Spec) (err error) {
 		// mergeMounts merge CRI mounts with extra mounts. If a mount destination
 		// is mounted by both a CRI mount and an extra mount, the CRI mount will
@@ -64,14 +64,17 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 
 		// Sort mounts in number of parts. This ensures that high level mounts don't
 		// shadow other mounts.
-		sort.Sort(orderedMounts(mounts))
+		sort.Stable(orderedMounts(mounts))
 
-		// Mount cgroup into the container as readonly, which inherits docker's behavior.
+		mode := "ro"
+		if cgroupWritable {
+			mode = "rw"
+		}
 		s.Mounts = append(s.Mounts, runtimespec.Mount{
 			Source:      "cgroup",
 			Destination: "/sys/fs/cgroup",
 			Type:        "cgroup",
-			Options:     []string{"nosuid", "noexec", "nodev", "relatime", "ro"},
+			Options:     []string{"nosuid", "noexec", "nodev", "relatime", mode},
 		})
 
 		// Copy all mounts from default mounts, except for
@@ -151,8 +154,24 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 			// NOTE(random-liu): we don't change all mounts to `ro` when root filesystem
 			// is readonly. This is different from docker's behavior, but make more sense.
 			if mount.GetReadonly() {
-				options = append(options, "ro")
+				if mount.GetRecursiveReadOnly() {
+					if handler == nil || !handler.Features.RecursiveReadOnlyMounts {
+						return fmt.Errorf("%w: runtime handler does not support recursive read-only mounts (hostPath=%q)",
+							crierrors.ErrRROUnsupported, mount.HostPath)
+					}
+					if mount.Propagation != runtime.MountPropagation_PROPAGATION_PRIVATE {
+						return fmt.Errorf("recursive read-only mount needs private propagation, got %q (hostPath=%q)",
+							mount.Propagation.String(), mount.HostPath)
+					}
+					options = append(options, "rro")
+				} else {
+					options = append(options, "ro")
+				}
 			} else {
+				if mount.GetRecursiveReadOnly() {
+					return fmt.Errorf("recursive read-only mount conflicts with RW mount (hostPath=%q)",
+						mount.HostPath)
+				}
 				options = append(options, "rw")
 			}
 
@@ -195,6 +214,17 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 		}
 		return nil
 	}
+}
+
+// WithMounts sorts and adds runtime and CRI mounts to the spec
+func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*runtime.Mount, mountLabel string, handler *runtime.RuntimeHandler) oci.SpecOpts {
+	return withMounts(osi, config, extra, mountLabel, handler, false)
+
+}
+
+// WithMountsCgroupWritable sorts and adds runtime and CRI mounts to the spec if cgroup_writable is enabled.
+func WithMountsCgroupWritable(osi osinterface.OS, config *runtime.ContainerConfig, extra []*runtime.Mount, mountLabel string, handler *runtime.RuntimeHandler) oci.SpecOpts {
+	return withMounts(osi, config, extra, mountLabel, handler, true)
 }
 
 // Ensure mount point on which path is mounted, is shared.
@@ -340,7 +370,7 @@ func WithResources(resources *runtime.LinuxContainerResources, tolerateMissingHu
 			s.Linux.Resources.CPU.Cpus = cpus
 		}
 		if mems := resources.GetCpusetMems(); mems != "" {
-			s.Linux.Resources.CPU.Mems = resources.GetCpusetMems()
+			s.Linux.Resources.CPU.Mems = mems
 		}
 		if limit != 0 {
 			s.Linux.Resources.Memory.Limit = &limit

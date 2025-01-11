@@ -32,8 +32,8 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/testsuite"
-	"github.com/containerd/containerd/v2/internal/testutil"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/snapshots/devmapper/dmsetup"
 	"github.com/containerd/log"
 )
@@ -145,9 +145,10 @@ func TestMultipleXfsMounts(t *testing.T) {
 
 	poolName := fmt.Sprintf("containerd-snapshotter-suite-pool-%d", time.Now().Nanosecond())
 	config := &Config{
-		RootPath:       t.TempDir(),
-		PoolName:       poolName,
-		BaseImageSize:  "16Mb",
+		RootPath: t.TempDir(),
+		PoolName: poolName,
+		// Size for xfs volume is kept at 300Mb because xfsprogs 5.19.0 (>=ubuntu 24.04) enforces a minimum volume size
+		BaseImageSize:  "300Mb",
 		FileSystemType: "xfs",
 	}
 	snapshotter, closer, err := createSnapshotter(ctx, t, config)

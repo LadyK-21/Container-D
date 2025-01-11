@@ -18,26 +18,51 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 
-	contentapi "github.com/containerd/containerd/v2/api/services/content/v1"
-	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/containerd/v2/protobuf"
-	protobuftypes "github.com/containerd/containerd/v2/protobuf/types"
+	contentapi "github.com/containerd/containerd/api/services/content/v1"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/ttrpc"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
+	protobuftypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 )
 
 type proxyContentStore struct {
-	client contentapi.ContentClient
+	// client is the rpc content client
+	// NOTE: ttrpc is used because it is the smaller interface shared with grpc
+	client contentapi.TTRPCContentClient
 }
 
 // NewContentStore returns a new content store which communicates over a GRPC
 // connection using the containerd content GRPC API.
-func NewContentStore(client contentapi.ContentClient) content.Store {
-	return &proxyContentStore{
-		client: client,
+func NewContentStore(client any) content.Store {
+	switch c := client.(type) {
+	case contentapi.ContentClient:
+		return &proxyContentStore{
+			client: convertClient{c},
+		}
+	case grpc.ClientConnInterface:
+		return &proxyContentStore{
+			client: convertClient{contentapi.NewContentClient(c)},
+		}
+	case contentapi.TTRPCContentClient:
+		return &proxyContentStore{
+			client: c,
+		}
+	case *ttrpc.Client:
+		return &proxyContentStore{
+			client: contentapi.NewTTRPCContentClient(c),
+		}
+	default:
+		panic(fmt.Errorf("unsupported content client %T: %w", client, errdefs.ErrNotImplemented))
 	}
 }
 
@@ -46,7 +71,7 @@ func (pcs *proxyContentStore) Info(ctx context.Context, dgst digest.Digest) (con
 		Digest: dgst.String(),
 	})
 	if err != nil {
-		return content.Info{}, errdefs.FromGRPC(err)
+		return content.Info{}, errgrpc.ToNative(err)
 	}
 
 	return infoFromGRPC(resp.Info), nil
@@ -57,14 +82,14 @@ func (pcs *proxyContentStore) Walk(ctx context.Context, fn content.WalkFunc, fil
 		Filters: filters,
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 
 	for {
 		msg, err := session.Recv()
 		if err != nil {
 			if err != io.EOF {
-				return errdefs.FromGRPC(err)
+				return errgrpc.ToNative(err)
 			}
 
 			break
@@ -84,7 +109,7 @@ func (pcs *proxyContentStore) Delete(ctx context.Context, dgst digest.Digest) er
 	if _, err := pcs.client.Delete(ctx, &contentapi.DeleteContentRequest{
 		Digest: dgst.String(),
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 
 	return nil
@@ -110,7 +135,7 @@ func (pcs *proxyContentStore) Status(ctx context.Context, ref string) (content.S
 		Ref: ref,
 	})
 	if err != nil {
-		return content.Status{}, errdefs.FromGRPC(err)
+		return content.Status{}, errgrpc.ToNative(err)
 	}
 
 	status := resp.Status
@@ -132,7 +157,7 @@ func (pcs *proxyContentStore) Update(ctx context.Context, info content.Info, fie
 		},
 	})
 	if err != nil {
-		return content.Info{}, errdefs.FromGRPC(err)
+		return content.Info{}, errgrpc.ToNative(err)
 	}
 	return infoFromGRPC(resp.Info), nil
 }
@@ -142,7 +167,7 @@ func (pcs *proxyContentStore) ListStatuses(ctx context.Context, filters ...strin
 		Filters: filters,
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 
 	var statuses []content.Status
@@ -170,7 +195,7 @@ func (pcs *proxyContentStore) Writer(ctx context.Context, opts ...content.Writer
 	}
 	wrclient, offset, err := pcs.negotiate(ctx, wOpts.Ref, wOpts.Desc.Size, wOpts.Desc.Digest)
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 
 	return &remoteWriter{
@@ -185,13 +210,13 @@ func (pcs *proxyContentStore) Abort(ctx context.Context, ref string) error {
 	if _, err := pcs.client.Abort(ctx, &contentapi.AbortRequest{
 		Ref: ref,
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 
 	return nil
 }
 
-func (pcs *proxyContentStore) negotiate(ctx context.Context, ref string, size int64, expected digest.Digest) (contentapi.Content_WriteClient, int64, error) {
+func (pcs *proxyContentStore) negotiate(ctx context.Context, ref string, size int64, expected digest.Digest) (contentapi.TTRPCContent_WriteClient, int64, error) {
 	wrclient, err := pcs.client.Write(ctx)
 	if err != nil {
 		return nil, 0, err
@@ -212,6 +237,70 @@ func (pcs *proxyContentStore) negotiate(ctx context.Context, ref string, size in
 	}
 
 	return wrclient, resp.Offset, nil
+}
+
+type convertClient struct {
+	contentapi.ContentClient
+}
+
+func (c convertClient) Info(ctx context.Context, req *contentapi.InfoRequest) (*contentapi.InfoResponse, error) {
+	return c.ContentClient.Info(ctx, req)
+}
+
+func (c convertClient) Update(ctx context.Context, req *contentapi.UpdateRequest) (*contentapi.UpdateResponse, error) {
+	return c.ContentClient.Update(ctx, req)
+}
+
+type convertListClient struct {
+	contentapi.Content_ListClient
+}
+
+func (c convertClient) List(ctx context.Context, req *contentapi.ListContentRequest) (contentapi.TTRPCContent_ListClient, error) {
+	lc, err := c.ContentClient.List(ctx, req)
+	if lc == nil {
+		return nil, err
+	}
+	return convertListClient{lc}, err
+}
+
+func (c convertClient) Delete(ctx context.Context, req *contentapi.DeleteContentRequest) (*emptypb.Empty, error) {
+	return c.ContentClient.Delete(ctx, req)
+}
+
+type convertReadClient struct {
+	contentapi.Content_ReadClient
+}
+
+func (c convertClient) Read(ctx context.Context, req *contentapi.ReadContentRequest) (contentapi.TTRPCContent_ReadClient, error) {
+	rc, err := c.ContentClient.Read(ctx, req)
+	if rc == nil {
+		return nil, err
+	}
+	return convertReadClient{rc}, err
+}
+
+func (c convertClient) Status(ctx context.Context, req *contentapi.StatusRequest) (*contentapi.StatusResponse, error) {
+	return c.ContentClient.Status(ctx, req)
+}
+
+func (c convertClient) ListStatuses(ctx context.Context, req *contentapi.ListStatusesRequest) (*contentapi.ListStatusesResponse, error) {
+	return c.ContentClient.ListStatuses(ctx, req)
+}
+
+type convertWriteClient struct {
+	contentapi.Content_WriteClient
+}
+
+func (c convertClient) Write(ctx context.Context) (contentapi.TTRPCContent_WriteClient, error) {
+	wc, err := c.ContentClient.Write(ctx)
+	if wc == nil {
+		return nil, err
+	}
+	return convertWriteClient{wc}, err
+}
+
+func (c convertClient) Abort(ctx context.Context, req *contentapi.AbortRequest) (*emptypb.Empty, error) {
+	return c.ContentClient.Abort(ctx, req)
 }
 
 func infoToGRPC(info *content.Info) *contentapi.Info {

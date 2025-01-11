@@ -22,7 +22,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -32,9 +31,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/containerd/errdefs"
+	"github.com/containerd/imgcrypt/v2"
+	"github.com/containerd/imgcrypt/v2/images/encryption"
 	"github.com/containerd/log"
 	distribution "github.com/distribution/reference"
-	imagedigest "github.com/opencontainers/go-digest"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -46,9 +47,9 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	crilabels "github.com/containerd/containerd/v2/internal/cri/labels"
+	"github.com/containerd/containerd/v2/internal/cri/util"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
-	"github.com/containerd/errdefs"
 )
 
 // For image management:
@@ -130,6 +131,20 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	inProgressImagePulls.Inc()
 	defer inProgressImagePulls.Dec()
 	startTime := time.Now()
+
+	if credentials == nil {
+		credentials = func(host string) (string, string, error) {
+			var hostauth *runtime.AuthConfig
+
+			config := c.config.Registry.Configs[host]
+			if config.Auth != nil {
+				hostauth = toRuntimeAuthConfig(*config.Auth)
+
+			}
+
+			return ParseAuth(hostauth, host)
+		}
+	}
 
 	namedRef, err := distribution.ParseDockerRef(name)
 	if err != nil {
@@ -218,12 +233,12 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	}
 	imageID := configDesc.Digest.String()
 
-	repoDigest, repoTag := getRepoDigestAndTag(namedRef, image.Target().Digest, isSchema1)
+	repoDigest, repoTag := util.GetRepoDigestAndTag(namedRef, image.Target().Digest, isSchema1)
 	for _, r := range []string{imageID, repoTag, repoDigest} {
 		if r == "" {
 			continue
 		}
-		if err := c.createImageReference(ctx, r, image.Target(), labels); err != nil {
+		if err := c.createOrUpdateImageReference(ctx, r, image.Target(), labels); err != nil {
 			return "", fmt.Errorf("failed to create image reference %q: %w", r, err)
 		}
 		// Update image store to reflect the newest state in containerd.
@@ -248,21 +263,6 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	// check the actual state in containerd before using the image or returning status of the
 	// image.
 	return imageID, nil
-}
-
-// getRepoDigestAngTag returns image repoDigest and repoTag of the named image reference.
-func getRepoDigestAndTag(namedRef distribution.Named, digest imagedigest.Digest, schema1 bool) (string, string) {
-	var repoTag, repoDigest string
-	if _, ok := namedRef.(distribution.NamedTagged); ok {
-		repoTag = namedRef.String()
-	}
-	if _, ok := namedRef.(distribution.Canonical); ok {
-		repoDigest = namedRef.String()
-	} else if !schema1 {
-		// digest is not actual repo digest for schema1 image.
-		repoDigest = namedRef.Name() + "@" + digest.String()
-	}
-	return repoDigest, repoTag
 }
 
 // ParseAuth parses AuthConfig and returns username and password/secret required by containerd.
@@ -304,11 +304,11 @@ func ParseAuth(auth *runtime.AuthConfig, host string) (string, string, error) {
 	return "", "", nil
 }
 
-// createImageReference creates image reference inside containerd image store.
+// createOrUpdateImageReference creates or updates image reference inside containerd image store.
 // Note that because create and update are not finished in one transaction, there could be race. E.g.
 // the image reference is deleted by someone else after create returns already exists, but before update
 // happens.
-func (c *CRIImageService) createImageReference(ctx context.Context, name string, desc imagespec.Descriptor, labels map[string]string) error {
+func (c *CRIImageService) createOrUpdateImageReference(ctx context.Context, name string, desc imagespec.Descriptor, labels map[string]string) error {
 	img := containerdimages.Image{
 		Name:   name,
 		Target: desc,
@@ -362,31 +362,42 @@ func (c *CRIImageService) getLabels(ctx context.Context, name string) map[string
 func (c *CRIImageService) UpdateImage(ctx context.Context, r string) error {
 	// TODO: Use image service
 	img, err := c.client.GetImage(ctx, r)
-	if err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("get image by reference: %w", err)
+	if err != nil {
+		if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("get image by reference: %w", err)
+		}
+		// If the image is not found, we should continue updating the cache,
+		// so that the image can be removed from the cache.
+		if err := c.imageStore.Update(ctx, r); err != nil {
+			return fmt.Errorf("update image store for %q: %w", r, err)
+		}
+		return nil
 	}
-	if err == nil && img.Labels()[crilabels.ImageLabelKey] != crilabels.ImageLabelValue {
-		// Make sure the image has the image id as its unique
-		// identifier that references the image in its lifetime.
-		configDesc, err := img.Config(ctx)
-		if err != nil {
-			return fmt.Errorf("get image id: %w", err)
-		}
-		id := configDesc.Digest.String()
-		labels := c.getLabels(ctx, r)
-		if err := c.createImageReference(ctx, id, img.Target(), labels); err != nil {
-			return fmt.Errorf("create image id reference %q: %w", id, err)
-		}
-		if err := c.imageStore.Update(ctx, id); err != nil {
-			return fmt.Errorf("update image store for %q: %w", id, err)
-		}
-		// The image id is ready, add the label to mark the image as managed.
-		if err := c.createImageReference(ctx, r, img.Target(), labels); err != nil {
-			return fmt.Errorf("create managed label: %w", err)
+
+	labels := img.Labels()
+	criLabels := c.getLabels(ctx, r)
+	for key, value := range criLabels {
+		if labels[key] != value {
+			// Make sure the image has the image id as its unique
+			// identifier that references the image in its lifetime.
+			configDesc, err := img.Config(ctx)
+			if err != nil {
+				return fmt.Errorf("get image id: %w", err)
+			}
+			id := configDesc.Digest.String()
+			if err := c.createOrUpdateImageReference(ctx, id, img.Target(), criLabels); err != nil {
+				return fmt.Errorf("create image id reference %q: %w", id, err)
+			}
+			if err := c.imageStore.Update(ctx, id); err != nil {
+				return fmt.Errorf("update image store for %q: %w", id, err)
+			}
+			// The image id is ready, add the label to mark the image as managed.
+			if err := c.createOrUpdateImageReference(ctx, r, img.Target(), criLabels); err != nil {
+				return fmt.Errorf("create managed label: %w", err)
+			}
+			break
 		}
 	}
-	// If the image is not found, we should continue updating the cache,
-	// so that the image can be removed from the cache.
 	if err := c.imageStore.Update(ctx, r); err != nil {
 		return fmt.Errorf("update image store for %q: %w", r, err)
 	}
@@ -436,7 +447,7 @@ func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(ho
 			}
 
 			var (
-				transport = newTransport()
+				transport = docker.DefaultHTTPTransport(nil) // no tls config
 				client    = &http.Client{Transport: transport}
 				config    = c.config.Registry.Configs[u.Host]
 			)
@@ -552,35 +563,18 @@ func (c *CRIImageService) registryEndpoints(host string) ([]string, error) {
 	return append(endpoints, defaultScheme(defaultHost)+"://"+defaultHost), nil
 }
 
-// newTransport returns a new HTTP transport used to pull image.
-// TODO(random-liu): Create a library and share this code with `ctr`.
-func newTransport() *http.Transport {
-	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:       30 * time.Second,
-			KeepAlive:     30 * time.Second,
-			FallbackDelay: 300 * time.Millisecond,
-		}).DialContext,
-		MaxIdleConns:          10,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 5 * time.Second,
-	}
-}
-
 // encryptedImagesPullOpts returns the necessary list of pull options required
 // for decryption of encrypted images based on the cri decryption configuration.
 // Temporarily removed for v2 upgrade
-//func (c *CRIImageService) encryptedImagesPullOpts() []containerd.RemoteOpt {
-//	if c.config.ImageDecryption.KeyModel == criconfig.KeyModelNode {
-//		ltdd := imgcrypt.Payload{}
-//		decUnpackOpt := encryption.WithUnpackConfigApplyOpts(encryption.WithDecryptedUnpack(&ltdd))
-//		opt := containerd.WithUnpackOpts([]containerd.UnpackOpt{decUnpackOpt})
-//		return []containerd.RemoteOpt{opt}
-//	}
-//	return nil
-//}
+func (c *CRIImageService) encryptedImagesPullOpts() []containerd.RemoteOpt {
+	if c.config.ImageDecryption.KeyModel == criconfig.KeyModelNode {
+		ltdd := imgcrypt.Payload{}
+		decUnpackOpt := encryption.WithUnpackConfigApplyOpts(encryption.WithDecryptedUnpack(&ltdd))
+		opt := containerd.WithUnpackOpts([]containerd.UnpackOpt{decUnpackOpt})
+		return []containerd.RemoteOpt{opt}
+	}
+	return nil
+}
 
 const (
 	// defaultPullProgressReportInterval represents that how often the

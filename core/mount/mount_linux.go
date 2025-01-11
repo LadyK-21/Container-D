@@ -26,9 +26,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/sys/userns"
 	"golang.org/x/sys/unix"
 )
 
@@ -95,6 +95,7 @@ func (m *Mount) mount(target string) (err error) {
 		usernsFd  *os.File
 		options   = m.Options
 	)
+
 	opt := parseMountOptions(options)
 	// The only remapping of both GID and UID is supported
 	if opt.uidmap != "" && opt.gidmap != "" {
@@ -186,8 +187,21 @@ func (m *Mount) mount(target string) (err error) {
 
 	const broflags = unix.MS_BIND | unix.MS_RDONLY
 	if oflags&broflags == broflags {
+		// Preserve CL_UNPRIVILEGED "locked" flags of the
+		// bind mount target when we remount to make the bind readonly.
+		// This is necessary to ensure that
+		// bind-mounting "with options" will not fail with user namespaces, due to
+		// kernel restrictions that require user namespace mounts to preserve
+		// CL_UNPRIVILEGED locked flags.
+		var unprivFlags int
+		if userns.RunningInUserNS() {
+			unprivFlags, err = getUnprivilegedMountFlags(target)
+			if err != nil {
+				return err
+			}
+		}
 		// Remount the bind to apply read only.
-		return unix.Mount("", target, "", uintptr(oflags|unix.MS_REMOUNT), "")
+		return unix.Mount("", target, "", uintptr(oflags|unprivFlags|unix.MS_REMOUNT), "")
 	}
 
 	// remap non-overlay mount point
@@ -199,6 +213,37 @@ func (m *Mount) mount(target string) (err error) {
 	return nil
 }
 
+// Get the set of mount flags that are set on the mount that contains the given
+// path and are locked by CL_UNPRIVILEGED.
+//
+// From https://github.com/moby/moby/blob/v23.0.1/daemon/oci_linux.go#L430-L460
+func getUnprivilegedMountFlags(path string) (int, error) {
+	var statfs unix.Statfs_t
+	if err := unix.Statfs(path, &statfs); err != nil {
+		return 0, err
+	}
+
+	// The set of keys come from https://github.com/torvalds/linux/blob/v4.13/fs/namespace.c#L1034-L1048.
+	unprivilegedFlags := []int{
+		unix.MS_RDONLY,
+		unix.MS_NODEV,
+		unix.MS_NOEXEC,
+		unix.MS_NOSUID,
+		unix.MS_NOATIME,
+		unix.MS_RELATIME,
+		unix.MS_NODIRATIME,
+	}
+
+	var flags int
+	for flag := range unprivilegedFlags {
+		if int(statfs.Flags)&flag == flag {
+			flags |= flag
+		}
+	}
+
+	return flags, nil
+}
+
 func doPrepareIDMappedOverlay(lowerDirs []string, usernsFd int) (tmpLowerDirs []string, _ func(), _ error) {
 	td, err := os.MkdirTemp(tempMountLocation, "ovl-idmapped")
 	if err != nil {
@@ -206,12 +251,22 @@ func doPrepareIDMappedOverlay(lowerDirs []string, usernsFd int) (tmpLowerDirs []
 	}
 	cleanUp := func() {
 		for _, lowerDir := range tmpLowerDirs {
-			if err := unix.Unmount(lowerDir, 0); err != nil {
-				logrus.WithError(err).Warnf("failed to unmount temp lowerdir %s", lowerDir)
+			// Do a detached unmount so even if the resource is busy, the mount will be
+			// gone (eventually) and we can safely delete the directory too.
+			if err := unix.Unmount(lowerDir, unix.MNT_DETACH); err != nil {
+				log.L.WithError(err).Warnf("failed to unmount temp lowerdir %s", lowerDir)
+				continue
+			}
+			// Using os.Remove() so if it's not empty, we don't delete files in the
+			// rootfs.
+			if err := os.Remove(lowerDir); err != nil {
+				log.L.WithError(err).Warnf("failed to remove temporary overlay lowerdir's")
 			}
 		}
-		if terr := os.RemoveAll(filepath.Clean(filepath.Join(tmpLowerDirs[0], ".."))); terr != nil {
-			logrus.WithError(terr).Warnf("failed to remove temporary overlay lowerdir's")
+
+		// This dir should be empty now. Otherwise, we don't do anything.
+		if err := os.Remove(filepath.Join(tmpLowerDirs[0], "..")); err != nil {
+			log.L.WithError(err).Infof("failed to remove temporary overlay dir")
 		}
 	}
 	for i, lowerDir := range lowerDirs {
@@ -226,92 +281,6 @@ func doPrepareIDMappedOverlay(lowerDirs []string, usernsFd int) (tmpLowerDirs []
 		}
 	}
 	return tmpLowerDirs, cleanUp, nil
-}
-
-// Unmount the provided mount path with the flags
-func Unmount(target string, flags int) error {
-	if err := unmount(target, flags); err != nil && err != unix.EINVAL {
-		return err
-	}
-	return nil
-}
-
-// fuseSuperMagic is defined in statfs(2)
-const fuseSuperMagic = 0x65735546
-
-func isFUSE(dir string) bool {
-	var st unix.Statfs_t
-	if err := unix.Statfs(dir, &st); err != nil {
-		return false
-	}
-	return st.Type == fuseSuperMagic
-}
-
-// unmountFUSE attempts to unmount using fusermount/fusermount3 helper binary.
-//
-// For FUSE mounts, using these helper binaries is preferred, see:
-// https://github.com/containerd/containerd/pull/3765#discussion_r342083514
-func unmountFUSE(target string) error {
-	var err error
-	for _, helperBinary := range []string{"fusermount3", "fusermount"} {
-		cmd := exec.Command(helperBinary, "-u", target)
-		err = cmd.Run()
-		if err == nil {
-			return nil
-		}
-	}
-	return err
-}
-
-func unmount(target string, flags int) error {
-	if isFUSE(target) {
-		if err := unmountFUSE(target); err == nil {
-			return nil
-		}
-	}
-	for i := 0; i < 50; i++ {
-		if err := unix.Unmount(target, flags); err != nil {
-			switch err {
-			case unix.EBUSY:
-				time.Sleep(50 * time.Millisecond)
-				continue
-			default:
-				return err
-			}
-		}
-		return nil
-	}
-	return fmt.Errorf("failed to unmount target %s: %w", target, unix.EBUSY)
-}
-
-// UnmountAll repeatedly unmounts the given mount point until there
-// are no mounts remaining (EINVAL is returned by mount), which is
-// useful for undoing a stack of mounts on the same mount point.
-// UnmountAll all is noop when the first argument is an empty string.
-// This is done when the containerd client did not specify any rootfs
-// mounts (e.g. because the rootfs is managed outside containerd)
-// UnmountAll is noop when the mount path does not exist.
-func UnmountAll(mount string, flags int) error {
-	if mount == "" {
-		return nil
-	}
-	if _, err := os.Stat(mount); os.IsNotExist(err) {
-		return nil
-	}
-
-	for {
-		if err := unmount(mount, flags); err != nil {
-			// EINVAL is returned if the target is not a
-			// mount point, indicating that we are
-			// done. It can also indicate a few other
-			// things (such as invalid flags) which we
-			// unfortunately end up squelching here too.
-			if err == unix.EINVAL {
-				return nil
-			}
-			return err
-		}
-	}
 }
 
 // parseMountOptions takes fstab style mount options and parses them for

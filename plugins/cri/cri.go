@@ -24,23 +24,20 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"google.golang.org/grpc"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/sandbox"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/constants"
 	"github.com/containerd/containerd/v2/internal/cri/instrument"
-	"github.com/containerd/containerd/v2/internal/cri/nri"
 	"github.com/containerd/containerd/v2/internal/cri/server"
-	nriservice "github.com/containerd/containerd/v2/pkg/nri"
+	nriservice "github.com/containerd/containerd/v2/internal/nri"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/platforms"
-
-	"google.golang.org/grpc"
-
-	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 // Register CRI service plugin
@@ -51,6 +48,7 @@ func init() {
 		ID:   "cri",
 		Requires: []plugin.Type{
 			plugins.CRIServicePlugin,
+			plugins.PodSandboxPlugin,
 			plugins.SandboxControllerPlugin,
 			plugins.NRIApiPlugin,
 			plugins.EventPlugin,
@@ -60,29 +58,9 @@ func init() {
 			plugins.TransferPlugin,
 			plugins.WarningPlugin,
 		},
-		Config: &defaultConfig,
-		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]interface{}) error {
-			if configVersion >= version.ConfigVersion {
-				return nil
-			}
-			const pluginName = string(plugins.GRPCPlugin) + ".cri"
-			original, ok := pluginConfigs[pluginName]
-			if !ok {
-				return nil
-			}
-			src := original.(map[string]interface{})
-
-			// Currently only a single key migrated
-			if val, ok := src["disable_tcp_service"]; ok {
-				pluginConfigs[pluginName] = map[string]interface{}{
-					"disable_tcp_service": val,
-				}
-			} else {
-				delete(pluginConfigs, pluginName)
-			}
-			return nil
-		},
-		InitFn: initCRIService,
+		Config:          &defaultConfig,
+		ConfigMigration: configMigration,
+		InitFn:          initCRIService,
 	})
 }
 
@@ -121,16 +99,14 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
 		containerd.WithDefaultPlatform(platforms.Default()),
 		containerd.WithInMemoryServices(ic),
-		containerd.WithInMemorySandboxControllers(ic),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerd client: %w", err)
 	}
 
-	// TODO(dmcgowan): Get the full list directly from configured plugins
-	sbControllers := map[string]sandbox.Controller{
-		string(criconfig.ModePodSandbox): client.SandboxController(string(criconfig.ModePodSandbox)),
-		string(criconfig.ModeShim):       client.SandboxController(string(criconfig.ModeShim)),
+	sbControllers, err := getSandboxControllers(ic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox controllers from plugins %v", err)
 	}
 
 	streamingConfig, err := config.StreamingConfig()
@@ -215,7 +191,7 @@ func (c criGRPCServerWithTCP) RegisterTCP(s *grpc.Server) error {
 }
 
 // Get the NRI plugin, and set up our NRI API for it.
-func getNRIAPI(ic *plugin.InitContext) *nri.API {
+func getNRIAPI(ic *plugin.InitContext) nriservice.API {
 	const (
 		pluginType = plugins.NRIApiPlugin
 		pluginName = "nri"
@@ -237,6 +213,53 @@ func getNRIAPI(ic *plugin.InitContext) *nri.API {
 	}
 
 	log.G(ctx).Info("using experimental NRI integration - disable nri plugin to prevent this")
+	return api
+}
 
-	return nri.NewAPI(api)
+func getSandboxControllers(ic *plugin.InitContext) (map[string]sandbox.Controller, error) {
+	sc := make(map[string]sandbox.Controller)
+	sandboxers, err := ic.GetByType(plugins.SandboxControllerPlugin)
+	if err != nil {
+		return nil, err
+	}
+	for name, p := range sandboxers {
+		sc[name] = p.(sandbox.Controller)
+	}
+
+	podSandboxers, err := ic.GetByType(plugins.PodSandboxPlugin)
+	if err != nil {
+		return nil, err
+	}
+	for name, p := range podSandboxers {
+		sc[name] = p.(sandbox.Controller)
+	}
+	return sc, nil
+}
+
+func configMigration(ctx context.Context, configVersion int, pluginConfigs map[string]interface{}) error {
+	if configVersion >= version.ConfigVersion {
+		return nil
+	}
+	const pluginName = string(plugins.GRPCPlugin) + ".cri"
+	src, ok := pluginConfigs[pluginName].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	dst := map[string]interface{}{}
+	for _, k := range []string{
+		"disable_tcp_service",
+		"stream_server_address",
+		"stream_server_port",
+		"stream_idle_timeout",
+		"enable_tls_streaming",
+		"x509_key_pair_streaming",
+	} {
+		if val, ok := src[k]; ok {
+			dst[k] = val
+		}
+	}
+
+	pluginConfigs[pluginName] = dst
+	return nil
 }

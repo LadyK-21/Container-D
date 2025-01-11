@@ -24,7 +24,7 @@ import (
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	"github.com/containerd/containerd/v2/internal/cri/store/stats"
-	"github.com/containerd/containerd/v2/protobuf"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
 	"github.com/stretchr/testify/assert"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -49,7 +49,6 @@ func TestGetUsageNanoCores(t *testing.T) {
 			expectedNanoCoreUsageSecond: 450,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			container, err := containerstore.NewContainer(
 				containerstore.Metadata{ID: ID},
@@ -362,7 +361,6 @@ func Test_criService_podSandboxStats(t *testing.T) {
 			expectError:            true,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			actualPodStats, actualContainerStats, err := c.toPodSandboxStats(test.sandbox, test.metrics, test.containers, currentStatsTimestamp)
 			if test.expectError {
@@ -567,7 +565,6 @@ func Test_criService_saveSandBoxMetrics(t *testing.T) {
 			},
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			c := newTestCRIService()
 			c.sandboxStore.Add(sandboxstore.Sandbox{

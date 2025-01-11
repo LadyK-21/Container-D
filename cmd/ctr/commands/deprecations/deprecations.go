@@ -24,10 +24,9 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	api "github.com/containerd/containerd/v2/api/services/introspection/v1"
+	api "github.com/containerd/containerd/api/services/introspection/v1"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands"
-	"github.com/containerd/containerd/v2/protobuf"
-	ptypes "github.com/containerd/containerd/v2/protobuf/types"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
 )
 
 // Command is the parent for all commands under "deprecations"
@@ -46,23 +45,23 @@ var listCommand = &cli.Command{
 			Usage: "output format to use (Examples: 'default', 'json')",
 		},
 	},
-	Action: func(context *cli.Context) error {
+	Action: func(cliContext *cli.Context) error {
 		// Suppress automatic warnings, since we print the warnings by ourselves.
 		os.Setenv("CONTAINERD_SUPPRESS_DEPRECATION_WARNINGS", "1")
 
-		client, ctx, cancel, err := commands.NewClient(context)
+		client, ctx, cancel, err := commands.NewClient(cliContext)
 		if err != nil {
 			return err
 		}
 		defer cancel()
 
-		resp, err := client.IntrospectionService().Server(ctx, &ptypes.Empty{})
+		resp, err := client.IntrospectionService().Server(ctx)
 		if err != nil {
 			return err
 		}
 		wrn := warnings(resp)
 		if len(wrn) > 0 {
-			switch context.String("format") {
+			switch cliContext.String("format") {
 			case "json":
 				commands.PrintAsJSON(warnings(resp))
 				return nil

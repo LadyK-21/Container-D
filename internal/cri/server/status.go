@@ -22,8 +22,7 @@ import (
 	"fmt"
 	goruntime "runtime"
 
-	"github.com/containerd/containerd/v2/api/services/introspection/v1"
-	ptypes "github.com/containerd/containerd/v2/protobuf/types"
+	"github.com/containerd/containerd/api/services/introspection/v1"
 	"github.com/containerd/log"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -58,6 +57,8 @@ func (c *criService) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 			runtimeCondition,
 			networkCondition,
 		}},
+		RuntimeHandlers: c.runtimeHandlers,
+		Features:        c.runtimeFeatures,
 	}
 	if r.Verbose {
 		configByt, err := json.Marshal(c.config)
@@ -96,7 +97,7 @@ func (c *criService) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 		}
 		resp.Info["lastCNILoadStatus"] = defaultStatus
 	}
-	intro, err := c.client.IntrospectionService().Server(ctx, &ptypes.Empty{})
+	intro, err := c.client.IntrospectionService().Server(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -1098,9 +1098,9 @@ func getSupplementalGroupsFromPath(root string, filter func(user.Group) bool) ([
 		// if there are no additional groups; just return an empty set
 		return []uint32{}, nil
 	}
-	addlGids := []uint32{}
-	for _, grp := range groups {
-		addlGids = append(addlGids, uint32(grp.Gid))
+	addlGids := make([]uint32, len(groups))
+	for i, grp := range groups {
+		addlGids[i] = uint32(grp.Gid)
 	}
 	return addlGids, nil
 }
@@ -1651,8 +1651,7 @@ func WithCDIDevices(devices ...string) SpecOpts {
 			return nil
 		}
 
-		registry := cdi.GetRegistry()
-		if err := registry.Refresh(); err != nil {
+		if err := cdi.Refresh(); err != nil {
 			// We don't consider registry refresh failure a fatal error.
 			// For instance, a dynamically generated invalid CDI Spec file for
 			// any particular vendor shouldn't prevent injection of devices of
@@ -1661,7 +1660,7 @@ func WithCDIDevices(devices ...string) SpecOpts {
 			log.G(ctx).Warnf("CDI registry refresh failed: %v", err)
 		}
 
-		if _, err := registry.InjectDevices(s, devices...); err != nil {
+		if _, err := cdi.InjectDevices(s, devices...); err != nil {
 			return fmt.Errorf("CDI device injection failed: %w", err)
 		}
 
