@@ -33,6 +33,14 @@ been **DEPRECATED**._ You should now point your registry `config_path` to the pa
 `hosts.toml` files are located.
 
 Modify your `config.toml` (default location: `/etc/containerd/config.toml`) as follows:
++ In containerd 2.x
+```
+version = 3
+
+[plugins."io.containerd.cri.v1.images".registry]
+   config_path = "/etc/containerd/certs.d"
+```
++ In containerd 1.x
 ```toml
 version = 2
 

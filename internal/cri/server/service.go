@@ -21,21 +21,29 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/containerd/go-cni"
 	"github.com/containerd/log"
-
+	"github.com/containerd/typeurl/v2"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/runtime-spec/specs-go/features"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubelet/pkg/cri/streaming"
 
+	apitypes "github.com/containerd/containerd/api/types"
+
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/introspection"
+	_ "github.com/containerd/containerd/v2/core/runtime" // for typeurl init
 	"github.com/containerd/containerd/v2/core/sandbox"
+	"github.com/containerd/containerd/v2/internal/cri/config"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/nri"
-	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox"
+	"github.com/containerd/containerd/v2/internal/cri/server/events"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	"github.com/containerd/containerd/v2/internal/cri/store/label"
@@ -43,10 +51,14 @@ import (
 	snapshotstore "github.com/containerd/containerd/v2/internal/cri/store/snapshot"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/internal/eventq"
+	nriservice "github.com/containerd/containerd/v2/internal/nri"
 	"github.com/containerd/containerd/v2/internal/registrar"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	osinterface "github.com/containerd/containerd/v2/pkg/os"
+	"github.com/containerd/containerd/v2/plugins"
 )
+
+var kernelSupportsRRO bool
 
 // defaultNetworkPlugin is used for the default CNI configuration
 const defaultNetworkPlugin = "default"
@@ -62,7 +74,14 @@ type CRIService interface {
 }
 
 type sandboxService interface {
-	SandboxController(config *runtime.PodSandboxConfig, runtimeHandler string) (sandbox.Controller, error)
+	CreateSandbox(ctx context.Context, info sandbox.Sandbox, opts ...sandbox.CreateOpt) error
+	StartSandbox(ctx context.Context, sandboxer string, sandboxID string) (sandbox.ControllerInstance, error)
+	WaitSandbox(ctx context.Context, sandboxer string, sandboxID string) (<-chan containerd.ExitStatus, error)
+	StopSandbox(ctx context.Context, sandboxer, sandboxID string, opts ...sandbox.StopOpt) error
+	ShutdownSandbox(ctx context.Context, sandboxer string, sandboxID string) error
+	SandboxStatus(ctx context.Context, sandboxer string, sandboxID string, verbose bool) (sandbox.ControllerStatus, error)
+	SandboxPlatform(ctx context.Context, sandboxer string, sandboxID string) (imagespec.Platform, error)
+	SandboxController(sandboxer string) (sandbox.Controller, error)
 }
 
 // RuntimeService specifies dependencies to runtime service which provides
@@ -118,7 +137,7 @@ type criService struct {
 	// streamServer is the streaming server serves container streaming request.
 	streamServer streaming.Server
 	// eventMonitor is the monitor monitors containerd events.
-	eventMonitor *eventMonitor
+	eventMonitor *events.EventMonitor
 	// initialized indicates whether the server is initialized. All GRPC services
 	// should return error before the server is initialized.
 	initialized atomic.Bool
@@ -135,6 +154,10 @@ type criService struct {
 	nri *nri.API
 	// sandboxService is the sandbox related service for CRI
 	sandboxService sandboxService
+	// runtimeHandlers contains runtime handler info
+	runtimeHandlers []*runtime.RuntimeHandler
+	// runtimeFeatures container runtime features info
+	runtimeFeatures *runtime.RuntimeFeatures
 }
 
 type CRIServiceOptions struct {
@@ -144,7 +167,7 @@ type CRIServiceOptions struct {
 
 	StreamingConfig streaming.Config
 
-	NRI *nri.API
+	NRI nriservice.API
 
 	// SandboxControllers is a map of all the loaded sandbox controllers
 	SandboxControllers map[string]sandbox.Controller
@@ -157,6 +180,7 @@ type CRIServiceOptions struct {
 
 // NewCRIService returns a new instance of CRIService
 func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServiceServer, error) {
+	ctx := context.Background()
 	var err error
 	labels := label.NewStore()
 	config := options.RuntimeService.Config()
@@ -173,7 +197,7 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 		sandboxNameIndex:   registrar.NewRegistrar(),
 		containerNameIndex: registrar.NewRegistrar(),
 		netPlugin:          make(map[string]cni.CNI),
-		sandboxService:     newCriSandboxService(&config, options.Client),
+		sandboxService:     newCriSandboxService(&config, options.SandboxControllers),
 	}
 
 	// TODO: Make discard time configurable
@@ -196,7 +220,7 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 		return nil, nil, fmt.Errorf("failed to create stream server: %w", err)
 	}
 
-	c.eventMonitor = newEventMonitor(c)
+	c.eventMonitor = events.NewEventMonitor(&criEventHandler{c: c})
 
 	c.cniNetConfMonitor = make(map[string]*cniNetConfSyncer)
 	for name, i := range c.netPlugin {
@@ -215,26 +239,26 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 		}
 	}
 
-	// Initialize pod sandbox controller
-	// TODO: Get this from options, NOT client
-	podSandboxController := options.Client.SandboxController(string(criconfig.ModePodSandbox)).(*podsandbox.Controller)
-	podSandboxController.Init(c)
+	c.nri = nri.NewAPI(options.NRI, &criImplementation{c})
 
-	c.nri = options.NRI
+	c.runtimeHandlers, err = c.introspectRuntimeHandlers(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to introspect runtime handlers: %w", err)
+	}
+
+	c.runtimeFeatures = &runtime.RuntimeFeatures{
+		SupplementalGroupsPolicy: true,
+	}
 
 	return c, c, nil
-}
-
-// BackOffEvent is a temporary workaround to call eventMonitor from controller.Stop.
-// TODO: get rid of this.
-func (c *criService) BackOffEvent(id string, event interface{}) {
-	c.eventMonitor.backOff.enBackOff(id, event)
 }
 
 // Run starts the CRI service.
 func (c *criService) Run(ready func()) error {
 	log.L.Info("Start subscribing containerd event")
-	c.eventMonitor.subscribe(c.client)
+	// note: filters are any match, if you want any match but not in namespace foo
+	// then you have to manually filter namespace foo
+	c.eventMonitor.Subscribe(c.client, []string{`topic=="/tasks/oom"`, `topic~="/images/"`})
 
 	log.L.Infof("Start recovering state")
 	if err := c.recover(ctrdutil.NamespacedContext()); err != nil {
@@ -243,7 +267,7 @@ func (c *criService) Run(ready func()) error {
 
 	// Start event handler.
 	log.L.Info("Start event monitor")
-	eventMonitorErrCh := c.eventMonitor.start()
+	eventMonitorErrCh := c.eventMonitor.Start()
 
 	// Start CNI network conf syncers
 	cniNetConfMonitorErrCh := make(chan error, len(c.cniNetConfMonitor))
@@ -280,7 +304,7 @@ func (c *criService) Run(ready func()) error {
 	}()
 
 	// register CRI domain with NRI
-	if err := c.nri.Register(&criImplementation{c}); err != nil {
+	if err := c.nri.Register(); err != nil {
 		return fmt.Errorf("failed to set up NRI for CRI service: %w", err)
 	}
 
@@ -329,7 +353,7 @@ func (c *criService) Close() error {
 			log.L.WithError(err).Errorf("failed to stop cni network conf monitor for %s", name)
 		}
 	}
-	c.eventMonitor.stop()
+	c.eventMonitor.Stop()
 	if err := c.streamServer.Stop(); err != nil {
 		return fmt.Errorf("failed to stop stream server: %w", err)
 	}
@@ -339,4 +363,98 @@ func (c *criService) Close() error {
 // IsInitialized indicates whether CRI service has finished initialization.
 func (c *criService) IsInitialized() bool {
 	return c.initialized.Load()
+}
+
+func (c *criService) introspectRuntimeHandlers(ctx context.Context) ([]*runtime.RuntimeHandler, error) {
+	var res []*runtime.RuntimeHandler
+	intro := c.client.IntrospectionService()
+	for name, r := range c.config.Runtimes {
+		h := runtime.RuntimeHandler{
+			Name: name,
+		}
+		rawFeatures, err := introspectRuntimeFeatures(ctx, intro, r)
+		if err != nil {
+			log.G(ctx).WithError(err).Debugf("failed to introspect features of runtime %q", name)
+		} else {
+			h.Features = &runtime.RuntimeHandlerFeatures{}
+			if slices.Contains(rawFeatures.MountOptions, "rro") {
+				if kernelSupportsRRO {
+					log.G(ctx).Debugf("runtime %q supports recursive read-only mounts", name)
+					h.Features.RecursiveReadOnlyMounts = true
+				} else {
+					log.G(ctx).Debugf("runtime %q supports recursive read-only mounts, but the kernel does not", name)
+				}
+			}
+			userns := supportsCRIUserns(rawFeatures)
+			h.Features.UserNamespaces = userns
+			log.G(ctx).Debugf("runtime %q supports CRI userns: %v", name, userns)
+		}
+		res = append(res, &h)
+		if name == c.config.DefaultRuntimeName {
+			defH := h
+			defH.Name = "" // denotes default
+			res = append(res, &defH)
+		}
+	}
+	return res, nil
+}
+
+func introspectRuntimeFeatures(ctx context.Context, intro introspection.Service, r config.Runtime) (*features.Features, error) {
+	if r.Type != plugins.RuntimeRuncV2 {
+		return nil, fmt.Errorf("introspecting OCI runtime features needs the runtime type to be %q, got %q",
+			plugins.RuntimeRuncV2, r.Type)
+		// For other runtimes, typeurl.MarshalAnyToProto will cause nil panic during typeurl dereference
+	}
+
+	rr := &apitypes.RuntimeRequest{
+		RuntimePath: r.Type, // "io.containerd.runc.v2"
+	}
+	if r.Path != "" {
+		rr.RuntimePath = r.Path // "/usr/local/bin/crun"
+	}
+	options, err := config.GenerateRuntimeOptions(r)
+	if err != nil {
+		return nil, err
+	}
+	if options != nil {
+		rr.Options, err = typeurl.MarshalAnyToProto(options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal %T: %w", options, err)
+		}
+	}
+
+	infoResp, err := intro.PluginInfo(ctx, string(plugins.RuntimePluginV2), "task", rr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call PluginInfo: %w", err)
+	}
+	var info apitypes.RuntimeInfo
+	if err := typeurl.UnmarshalTo(infoResp.Extra, &info); err != nil {
+		return nil, fmt.Errorf("failed to get runtime info from plugin info: %w", err)
+	}
+	featuresX, err := typeurl.UnmarshalAny(info.Features)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal Features (%T): %w", info.Features, err)
+	}
+	features, ok := featuresX.(*features.Features)
+	if !ok {
+		return nil, fmt.Errorf("unknown features type %T", featuresX)
+	}
+	return features, nil
+}
+
+func supportsCRIUserns(f *features.Features) bool {
+	if f == nil {
+		return false
+	}
+	userns := slices.Contains(f.Linux.Namespaces, "user")
+
+	var idmap bool
+	if m := f.Linux.MountExtensions; m != nil && m.IDMap != nil && m.IDMap.Enabled != nil {
+		if *m.IDMap.Enabled {
+			idmap = true
+		}
+	}
+
+	// user namespace support in CRI requires userns and idmap support.
+	return userns && idmap
 }

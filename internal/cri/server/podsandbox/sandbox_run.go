@@ -75,10 +75,7 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		labels = map[string]string{}
 	)
 
-	sandboxImage := c.imageService.PinnedImage("sandbox")
-	if sandboxImage == "" {
-		sandboxImage = criconfig.DefaultSandboxImage
-	}
+	sandboxImage := c.getSandboxImageName()
 	// Ensure sandbox container image snapshot.
 	image, err := c.ensureImageExists(ctx, sandboxImage, config, metadata.RuntimeHandler)
 	if err != nil {
@@ -97,6 +94,39 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 	log.G(ctx).WithField("podsandboxid", id).Debugf("use OCI runtime %+v", ociRuntime)
 
 	labels["oci_runtime_type"] = ociRuntime.Type
+
+	// Create sandbox container root directories.
+	sandboxRootDir := c.getSandboxRootDir(id)
+	if err := c.os.MkdirAll(sandboxRootDir, 0755); err != nil {
+		return cin, fmt.Errorf("failed to create sandbox root directory %q: %w",
+			sandboxRootDir, err)
+	}
+	defer func() {
+		if retErr != nil && cleanupErr == nil {
+			// Cleanup the sandbox root directory.
+			if cleanupErr = c.os.RemoveAll(sandboxRootDir); cleanupErr != nil {
+				log.G(ctx).WithError(cleanupErr).Errorf("Failed to remove sandbox root directory %q",
+					sandboxRootDir)
+			}
+		}
+	}()
+
+	volatileSandboxRootDir := c.getVolatileSandboxRootDir(id)
+	if err := c.os.MkdirAll(volatileSandboxRootDir, 0755); err != nil {
+		return cin, fmt.Errorf("failed to create volatile sandbox root directory %q: %w",
+			volatileSandboxRootDir, err)
+	}
+	defer func() {
+		if retErr != nil && cleanupErr == nil {
+			deferCtx, deferCancel := ctrdutil.DeferContext()
+			defer deferCancel()
+			// Cleanup the volatile sandbox root directory.
+			if cleanupErr = ensureRemoveAll(deferCtx, volatileSandboxRootDir); cleanupErr != nil {
+				log.G(ctx).WithError(cleanupErr).Errorf("Failed to remove volatile sandbox root directory %q",
+					volatileSandboxRootDir)
+			}
+		}
+	}()
 
 	// Create sandbox container.
 	// NOTE: sandboxContainerSpec SHOULD NOT have side
@@ -133,7 +163,7 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		return cin, fmt.Errorf("failed to generate sandbox container spec options: %w", err)
 	}
 
-	sandboxLabels := buildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindSandbox)
+	sandboxLabels := ctrdutil.BuildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindSandbox)
 
 	snapshotterOpt := []snapshots.Opt{snapshots.WithLabels(snapshots.FilterInheritedLabels(config.Annotations))}
 	extraSOpts, err := sandboxSnapshotterOpts(config)
@@ -167,37 +197,6 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		}
 	}()
 
-	// Create sandbox container root directories.
-	sandboxRootDir := c.getSandboxRootDir(id)
-	if err := c.os.MkdirAll(sandboxRootDir, 0755); err != nil {
-		return cin, fmt.Errorf("failed to create sandbox root directory %q: %w",
-			sandboxRootDir, err)
-	}
-	defer func() {
-		if retErr != nil && cleanupErr == nil {
-			// Cleanup the sandbox root directory.
-			if cleanupErr = c.os.RemoveAll(sandboxRootDir); cleanupErr != nil {
-				log.G(ctx).WithError(cleanupErr).Errorf("Failed to remove sandbox root directory %q",
-					sandboxRootDir)
-			}
-		}
-	}()
-
-	volatileSandboxRootDir := c.getVolatileSandboxRootDir(id)
-	if err := c.os.MkdirAll(volatileSandboxRootDir, 0755); err != nil {
-		return cin, fmt.Errorf("failed to create volatile sandbox root directory %q: %w",
-			volatileSandboxRootDir, err)
-	}
-	defer func() {
-		if retErr != nil && cleanupErr == nil {
-			// Cleanup the volatile sandbox root directory.
-			if cleanupErr = c.os.RemoveAll(volatileSandboxRootDir); cleanupErr != nil {
-				log.G(ctx).WithError(cleanupErr).Errorf("Failed to remove volatile sandbox root directory %q",
-					volatileSandboxRootDir)
-			}
-		}
-	}()
-
 	// Setup files required for the sandbox.
 	if err = c.setupSandboxFiles(id, config); err != nil {
 		return cin, fmt.Errorf("failed to setup sandbox files: %w", err)
@@ -216,7 +215,6 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 	if err != nil {
 		return cin, fmt.Errorf("failed to get sandbox container info: %w", err)
 	}
-	podSandbox.CreatedAt = info.CreatedAt
 
 	// Create sandbox task in containerd.
 	log.G(ctx).Tracef("Create sandbox container (id=%q, name=%q).", id, metadata.Name)
@@ -242,7 +240,6 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 			}
 		}
 	}()
-	podSandbox.Pid = task.Pid()
 
 	// wait is a long running background request, no timeout needed.
 	exitCh, err := task.Wait(ctrdutil.NamespacedContext())
@@ -267,7 +264,15 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 	if err := task.Start(ctx); err != nil {
 		return cin, fmt.Errorf("failed to start sandbox container task %q: %w", id, err)
 	}
-	podSandbox.State = sandboxstore.StateReady
+	pid := task.Pid()
+	if err := podSandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
+		status.Pid = pid
+		status.State = sandboxstore.StateReady
+		status.CreatedAt = info.CreatedAt
+		return status, nil
+	}); err != nil {
+		return cin, fmt.Errorf("failed to update status of pod sandbox %q: %w", id, err)
+	}
 
 	cin.SandboxID = id
 	cin.Pid = task.Pid()
@@ -275,8 +280,9 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 	cin.Labels = labels
 
 	go func() {
-		code, exitTime, err := c.waitSandboxExit(ctrdutil.NamespacedContext(), podSandbox, exitCh)
-		podSandbox.Exit(*containerd.NewExitStatus(code, exitTime, err))
+		if err := c.waitSandboxExit(ctrdutil.NamespacedContext(), podSandbox, exitCh); err != nil {
+			log.G(context.Background()).Warnf("failed to wait pod sandbox exit %v", err)
+		}
 	}()
 
 	return
@@ -313,4 +319,16 @@ func (c *Controller) ensureImageExists(ctx context.Context, ref string, config *
 		return nil, fmt.Errorf("failed to get image %q after pulling: %w", imageID, err)
 	}
 	return &newImage, nil
+}
+
+func (c *Controller) getSandboxImageName() string {
+	// returns the name of the sandbox image used to scope pod shared resources used by the pod's containers,
+	// if empty return the default sandbox image.
+	if c.imageService != nil {
+		sandboxImage := c.imageService.PinnedImage("sandbox")
+		if sandboxImage != "" {
+			return sandboxImage
+		}
+	}
+	return criconfig.DefaultSandboxImage
 }

@@ -26,8 +26,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/log/logtest"
+
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 )
 
 const allCaps = docker.HostCapabilityPull | docker.HostCapabilityResolve | docker.HostCapabilityPush
@@ -361,8 +362,8 @@ func TestHTTPFallback(t *testing.T) {
 					InsecureSkipVerify: true,
 				},
 			},
-			expectedScheme: "http",
-			usesFallback:   false,
+			expectedScheme: "https",
+			usesFallback:   true,
 		},
 		{
 			host: "localhost",
@@ -402,8 +403,8 @@ func TestHTTPFallback(t *testing.T) {
 					InsecureSkipVerify: true,
 				},
 			},
-			expectedScheme: "http",
-			usesFallback:   false,
+			expectedScheme: "https",
+			usesFallback:   true,
 		},
 		{
 			host: "example.com:5000",
@@ -472,11 +473,11 @@ func TestHTTPFallback(t *testing.T) {
 			if testHosts[0].Scheme != tc.expectedScheme {
 				t.Fatalf("expected %s scheme for localhost with tls config, got %q", tc.expectedScheme, testHosts[0].Scheme)
 			}
-			_, ok := testHosts[0].Client.Transport.(docker.HTTPFallback)
-			if tc.usesFallback && !ok {
+			_, defaultTransport := testHosts[0].Client.Transport.(*http.Transport)
+			if tc.usesFallback && defaultTransport {
 				t.Fatal("expected http fallback configured for defaulted localhost endpoint")
-			} else if ok && !tc.usesFallback {
-				t.Fatal("expected no http fallback configured for defaulted localhost endpoint")
+			} else if !defaultTransport && !tc.usesFallback {
+				t.Fatalf("expected no http fallback configured for defaulted localhost endpoint")
 			}
 		})
 	}

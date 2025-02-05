@@ -31,17 +31,8 @@ import (
 	"testing"
 	"time"
 
-	apievents "github.com/containerd/containerd/v2/api/events"
-	. "github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/containers"
-	"github.com/containerd/containerd/v2/core/images"
-	_ "github.com/containerd/containerd/v2/core/runtime"
-	"github.com/containerd/containerd/v2/core/runtime/v2/runc/options"
-	"github.com/containerd/containerd/v2/pkg/cio"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/containerd/v2/pkg/oci"
-	"github.com/containerd/containerd/v2/plugins"
-	gogotypes "github.com/containerd/containerd/v2/protobuf/types"
+	apievents "github.com/containerd/containerd/api/events"
+	"github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/go-runc"
@@ -50,6 +41,16 @@ import (
 	"github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/require"
+
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/images"
+	_ "github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	gogotypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func empty() cio.Creator {
@@ -571,44 +572,61 @@ func TestContainerPids(t *testing.T) {
 		t.Errorf("invalid task pid %d", taskPid)
 	}
 
-	processes, err := task.Pids(ctx)
-	if err != nil {
-		t.Fatal(err)
+	tryUntil := time.Now().Add(time.Second)
+	checkPids := func() bool {
+		processes, err := task.Pids(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		l := len(processes)
+		// The point of this test is to see that we successfully can get all of
+		// the pids running in the container and they match the number expected,
+		// but for Windows this concept is a bit different. Windows containers
+		// essentially go through the usermode boot phase of the operating system,
+		// and have quite a few processes and system services running outside of
+		// the "init" process you specify. Because of this, there's not a great
+		// way to say "there should only be N processes running" like we can ensure
+		// for Linux based off the process we asked to run.
+		//
+		// With all that said, on Windows lets check that we're greater than one
+		// ("init" + system services/procs)
+		if runtime.GOOS == "windows" {
+			if l <= 1 {
+				t.Errorf("expected more than one process but received %d", l)
+			}
+		} else {
+			// 2 processes, 1 for sh and one for sleep
+			if l != 2 {
+				if l == 1 && time.Now().Before(tryUntil) {
+					// The subcommand may not have been started when the
+					// pids are requested. Retrying is a simple way to
+					// handle the race under normal conditions. A better
+					// but more complex solution would be first waiting
+					// for output from the subprocess to be seen.
+					return true
+				}
+				t.Errorf("expected 2 process but received %d", l)
+			}
+		}
+
+		var found bool
+		for _, p := range processes {
+			if p.Pid == taskPid {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("pid %d must be in %+v", taskPid, processes)
+		}
+		return false
 	}
 
-	l := len(processes)
-	// The point of this test is to see that we successfully can get all of
-	// the pids running in the container and they match the number expected,
-	// but for Windows this concept is a bit different. Windows containers
-	// essentially go through the usermode boot phase of the operating system,
-	// and have quite a few processes and system services running outside of
-	// the "init" process you specify. Because of this, there's not a great
-	// way to say "there should only be N processes running" like we can ensure
-	// for Linux based off the process we asked to run.
-	//
-	// With all that said, on Windows lets check that we're greater than one
-	// ("init" + system services/procs)
-	if runtime.GOOS == "windows" {
-		if l <= 1 {
-			t.Errorf("expected more than one process but received %d", l)
-		}
-	} else {
-		// 2 processes, 1 for sh and one for sleep
-		if l != 2 {
-			t.Errorf("expected 2 process but received %d", l)
-		}
+	for checkPids() {
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	var found bool
-	for _, p := range processes {
-		if p.Pid == taskPid {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("pid %d must be in %+v", taskPid, processes)
-	}
 	if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
 		select {
 		case s := <-statusC:
@@ -1737,7 +1755,7 @@ func TestContainerHook(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		s.Hooks.Prestart = []specs.Hook{
+		s.Hooks.CreateRuntime = []specs.Hook{
 			{
 				Path: path,
 				Args: []string{

@@ -23,12 +23,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/moby/sys/userns"
+	"golang.org/x/sys/unix"
+
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
-	"github.com/containerd/containerd/v2/pkg/userns"
 	"github.com/containerd/errdefs"
-
-	"golang.org/x/sys/unix"
 )
 
 func apply(ctx context.Context, mounts []mount.Mount, r io.Reader, sync bool) (retErr error) {
@@ -97,9 +97,9 @@ func doSyncFs(file string) error {
 	}
 	defer fd.Close()
 
-	_, _, errno := unix.Syscall(unix.SYS_SYNCFS, fd.Fd(), 0, 0)
-	if errno != 0 {
-		return fmt.Errorf("failed to syncfs for %s: %w", file, errno)
+	err = unix.Syncfs(int(fd.Fd()))
+	if err != nil {
+		return fmt.Errorf("failed to syncfs for %s: %w", file, err)
 	}
 	return nil
 }

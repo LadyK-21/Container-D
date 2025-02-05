@@ -471,6 +471,24 @@ func WithDevice(containerPath, hostPath, permissions string) ContainerOpts {
 	}
 }
 
+// WithSELinuxOptions allows to set SELinux option for container.
+func WithSELinuxOptions(user, role, typ, level string) ContainerOpts {
+	return func(c *runtime.ContainerConfig) {
+		if c.Linux == nil {
+			c.Linux = &runtime.LinuxContainerConfig{}
+		}
+		if c.Linux.SecurityContext == nil {
+			c.Linux.SecurityContext = &runtime.LinuxContainerSecurityContext{}
+		}
+		c.Linux.SecurityContext.SelinuxOptions = &runtime.SELinuxOption{
+			User:  user,
+			Role:  role,
+			Type:  typ,
+			Level: level,
+		}
+	}
+}
+
 // ContainerConfig creates a container config given a name and image name
 // and additional container config options
 func ContainerConfig(name, image string, opts ...ContainerOpts) *runtime.ContainerConfig {
@@ -656,9 +674,7 @@ func RawRuntimeClient() (runtime.RuntimeServiceClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dialer: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 	)

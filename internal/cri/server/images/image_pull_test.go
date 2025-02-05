@@ -21,15 +21,14 @@ import (
 	"encoding/base64"
 	"testing"
 
-	docker "github.com/distribution/reference"
-	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/assert"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"github.com/containerd/platforms"
 
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/labels"
-	"github.com/containerd/platforms"
 )
 
 func TestParseAuth(t *testing.T) {
@@ -114,7 +113,6 @@ func TestParseAuth(t *testing.T) {
 			expectedSecret: testPasswd,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			u, s, err := ParseAuth(test.auth, test.host)
 			assert.Equal(t, test.expectErr, err != nil)
@@ -273,7 +271,6 @@ func TestRegistryEndpoints(t *testing.T) {
 			},
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			c, _ := newTestCRIService()
 			c.config.Registry.Mirrors = test.mirrors
@@ -341,7 +338,6 @@ func TestDefaultScheme(t *testing.T) {
 			expected: "https",
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			got := defaultScheme(test.host)
 			assert.Equal(t, test.expected, got)
@@ -350,57 +346,56 @@ func TestDefaultScheme(t *testing.T) {
 }
 
 // Temporarily remove for v2 upgrade
-//func TestEncryptedImagePullOpts(t *testing.T) {
-//	for _, test := range []struct {
-//		desc         string
-//		keyModel     string
-//		expectedOpts int
-//	}{
-//		{
-//			desc:         "node key model should return one unpack opt",
-//			keyModel:     criconfig.KeyModelNode,
-//			expectedOpts: 1,
-//		},
-//		{
-//			desc:         "no key model selected should default to node key model",
-//			keyModel:     "",
-//			expectedOpts: 0,
-//		},
-//	} {
-//		test := test
-//		t.Run(test.desc, func(t *testing.T) {
-//			c, _ := newTestCRIService()
-//			c.config.ImageDecryption.KeyModel = test.keyModel
-//			got := len(c.encryptedImagesPullOpts())
-//			assert.Equal(t, test.expectedOpts, got)
-//		})
-//	}
-//}
-
-func TestSnapshotterFromPodSandboxConfig(t *testing.T) {
-	defaultSnashotter := "native"
-	runtimeSnapshotter := "devmapper"
-	tests := []struct {
-		desc              string
-		podSandboxConfig  *runtime.PodSandboxConfig
-		expectSnapshotter string
-		expectErr         bool
+func TestEncryptedImagePullOpts(t *testing.T) {
+	for _, test := range []struct {
+		desc         string
+		keyModel     string
+		expectedOpts int
 	}{
 		{
-			desc:              "should return default snapshotter for nil podSandboxConfig",
-			expectSnapshotter: defaultSnashotter,
+			desc:         "node key model should return one unpack opt",
+			keyModel:     criconfig.KeyModelNode,
+			expectedOpts: 1,
 		},
 		{
-			desc:              "should return default snapshotter for nil podSandboxConfig.Annotations",
-			podSandboxConfig:  &runtime.PodSandboxConfig{},
-			expectSnapshotter: defaultSnashotter,
+			desc:         "no key model selected should default to node key model",
+			keyModel:     "",
+			expectedOpts: 0,
+		},
+	} {
+		t.Run(test.desc, func(t *testing.T) {
+			c, _ := newTestCRIService()
+			c.config.ImageDecryption.KeyModel = test.keyModel
+			got := len(c.encryptedImagesPullOpts())
+			assert.Equal(t, test.expectedOpts, got)
+		})
+	}
+}
+
+func TestSnapshotterFromPodSandboxConfig(t *testing.T) {
+	defaultSnapshotter := "native"
+	runtimeSnapshotter := "devmapper"
+	tests := []struct {
+		desc                string
+		podSandboxConfig    *runtime.PodSandboxConfig
+		expectedSnapshotter string
+		expectedErr         bool
+	}{
+		{
+			desc:                "should return default snapshotter for nil podSandboxConfig",
+			expectedSnapshotter: defaultSnapshotter,
+		},
+		{
+			desc:                "should return default snapshotter for nil podSandboxConfig.Annotations",
+			podSandboxConfig:    &runtime.PodSandboxConfig{},
+			expectedSnapshotter: defaultSnapshotter,
 		},
 		{
 			desc: "should return default snapshotter for empty podSandboxConfig.Annotations",
 			podSandboxConfig: &runtime.PodSandboxConfig{
 				Annotations: make(map[string]string),
 			},
-			expectSnapshotter: defaultSnashotter,
+			expectedSnapshotter: defaultSnapshotter,
 		},
 		{
 			desc: "should return default snapshotter for runtime not found",
@@ -409,78 +404,32 @@ func TestSnapshotterFromPodSandboxConfig(t *testing.T) {
 					annotations.RuntimeHandler: "runtime-not-exists",
 				},
 			},
-			expectSnapshotter: defaultSnashotter,
+			expectedSnapshotter: defaultSnapshotter,
 		},
 		{
 			desc: "should return snapshotter provided in podSandboxConfig.Annotations",
 			podSandboxConfig: &runtime.PodSandboxConfig{
 				Annotations: map[string]string{
-					annotations.RuntimeHandler: "exiting-runtime",
+					annotations.RuntimeHandler: "existing-runtime",
 				},
 			},
-			expectSnapshotter: runtimeSnapshotter,
+			expectedSnapshotter: runtimeSnapshotter,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
 			cri, _ := newTestCRIService()
-			cri.config.Snapshotter = defaultSnashotter
-			cri.runtimePlatforms["exiting-runtime"] = ImagePlatform{
+			cri.config.Snapshotter = defaultSnapshotter
+			cri.runtimePlatforms["existing-runtime"] = ImagePlatform{
 				Platform:    platforms.DefaultSpec(),
 				Snapshotter: runtimeSnapshotter,
 			}
 			snapshotter, err := cri.snapshotterFromPodSandboxConfig(context.Background(), "test-image", tt.podSandboxConfig)
-			assert.Equal(t, tt.expectSnapshotter, snapshotter)
-			if tt.expectErr {
+			assert.Equal(t, tt.expectedSnapshotter, snapshotter)
+			if tt.expectedErr {
 				assert.Error(t, err)
 			}
-		})
-	}
-}
-
-func TestGetRepoDigestAndTag(t *testing.T) {
-	digest := digest.Digest("sha256:e6693c20186f837fc393390135d8a598a96a833917917789d63766cab6c59582")
-	for _, test := range []struct {
-		desc               string
-		ref                string
-		schema1            bool
-		expectedRepoDigest string
-		expectedRepoTag    string
-	}{
-		{
-			desc:               "repo tag should be empty if original ref has no tag",
-			ref:                "gcr.io/library/busybox@" + digest.String(),
-			expectedRepoDigest: "gcr.io/library/busybox@" + digest.String(),
-		},
-		{
-			desc:               "repo tag should not be empty if original ref has tag",
-			ref:                "gcr.io/library/busybox:latest",
-			expectedRepoDigest: "gcr.io/library/busybox@" + digest.String(),
-			expectedRepoTag:    "gcr.io/library/busybox:latest",
-		},
-		{
-			desc:               "repo digest should be empty if original ref is schema1 and has no digest",
-			ref:                "gcr.io/library/busybox:latest",
-			schema1:            true,
-			expectedRepoDigest: "",
-			expectedRepoTag:    "gcr.io/library/busybox:latest",
-		},
-		{
-			desc:               "repo digest should not be empty if original ref is schema1 but has digest",
-			ref:                "gcr.io/library/busybox@sha256:e6693c20186f837fc393390135d8a598a96a833917917789d63766cab6c59594",
-			schema1:            true,
-			expectedRepoDigest: "gcr.io/library/busybox@sha256:e6693c20186f837fc393390135d8a598a96a833917917789d63766cab6c59594",
-			expectedRepoTag:    "",
-		},
-	} {
-		test := test
-		t.Run(test.desc, func(t *testing.T) {
-			named, err := docker.ParseDockerRef(test.ref)
-			assert.NoError(t, err)
-			repoDigest, repoTag := getRepoDigestAndTag(named, digest, test.schema1)
-			assert.Equal(t, test.expectedRepoDigest, repoDigest)
-			assert.Equal(t, test.expectedRepoTag, repoTag)
 		})
 	}
 }
@@ -498,8 +447,8 @@ func TestImageGetLabels(t *testing.T) {
 		{
 			name:          "pinned image labels should get added on sandbox image",
 			expectedLabel: map[string]string{labels.ImageLabelKey: labels.ImageLabelValue, labels.PinnedImageLabelKey: labels.PinnedImageLabelValue},
-			pinnedImages:  map[string]string{"sandbox": "k8s.gcr.io/pause:3.9"},
-			pullImageName: "k8s.gcr.io/pause:3.9",
+			pinnedImages:  map[string]string{"sandbox": "k8s.gcr.io/pause:3.10"},
+			pullImageName: "k8s.gcr.io/pause:3.10",
 		},
 		{
 			name:          "pinned image labels should get added on sandbox image without tag",

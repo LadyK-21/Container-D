@@ -58,8 +58,10 @@ func (c *criService) recover(ctx context.Context) error {
 		return fmt.Errorf("failed to list sandbox containers: %w", err)
 	}
 
-	podSandboxController := c.client.SandboxController(string(criconfig.ModePodSandbox))
-
+	podSandboxController, err := c.sandboxService.SandboxController(string(criconfig.ModePodSandbox))
+	if err != nil {
+		return fmt.Errorf("failed to get podsanbox controller %v", err)
+	}
 	podSandboxLoader, ok := podSandboxController.(podSandboxRecover)
 	if !ok {
 		log.G(ctx).Fatal("pod sandbox controller doesn't support recovery")
@@ -67,7 +69,6 @@ func (c *criService) recover(ctx context.Context) error {
 
 	eg, ctx2 := errgroup.WithContext(ctx)
 	for _, sandbox := range sandboxes {
-		sandbox := sandbox
 		eg.Go(func() error {
 			sb, err := podSandboxLoader.RecoverContainer(ctx2, sandbox)
 			if err != nil {
@@ -109,11 +110,11 @@ func (c *criService) recover(ctx context.Context) error {
 		}
 
 		var (
-			state      = sandboxstore.StateUnknown
-			controller = c.client.SandboxController(sbx.Sandboxer)
+			state    = sandboxstore.StateUnknown
+			endpoint sandboxstore.Endpoint
 		)
 
-		status, err := controller.Status(ctx, sbx.ID, false)
+		status, err := c.sandboxService.SandboxStatus(ctx, sbx.Sandboxer, sbx.ID, false)
 		if err != nil {
 			log.G(ctx).
 				WithError(err).
@@ -124,6 +125,8 @@ func (c *criService) recover(ctx context.Context) error {
 				state = sandboxstore.StateNotReady
 			}
 		} else {
+			endpoint.Version = status.Version
+			endpoint.Address = status.Address
 			if code, ok := runtime.PodSandboxState_value[status.State]; ok {
 				if code == int32(runtime.PodSandboxState_SANDBOX_READY) {
 					state = sandboxstore.StateReady
@@ -134,6 +137,8 @@ func (c *criService) recover(ctx context.Context) error {
 		}
 
 		sb := sandboxstore.NewSandbox(metadata, sandboxstore.Status{State: state})
+		sb.Sandboxer = sbx.Sandboxer
+		sb.Endpoint = endpoint
 
 		// Load network namespace.
 		sb.NetNS = getNetNS(&metadata)
@@ -144,26 +149,16 @@ func (c *criService) recover(ctx context.Context) error {
 	}
 
 	for _, sb := range c.sandboxStore.List() {
-		sb := sb
 		status := sb.Status.Get()
 		if status.State == sandboxstore.StateNotReady {
 			continue
 		}
-		controller, err := c.sandboxService.SandboxController(sb.Config, sb.RuntimeHandler)
+		exitCh, err := c.sandboxService.WaitSandbox(ctrdutil.NamespacedContext(), sb.Sandboxer, sb.ID)
 		if err != nil {
-			log.G(ctx).WithError(err).Error("failed to get sandbox controller while waiting sandbox")
+			log.G(ctx).WithError(err).Error("failed to wait sandbox")
 			continue
 		}
-		exitCh := make(chan containerd.ExitStatus, 1)
-		go func() {
-			exit, err := controller.Wait(ctrdutil.NamespacedContext(), sb.ID)
-			if err != nil {
-				log.G(ctx).WithError(err).Error("failed to wait for sandbox exit")
-				exitCh <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, err)
-			}
-			exitCh <- *containerd.NewExitStatus(exit.ExitStatus, exit.ExitedAt, nil)
-		}()
-		c.eventMonitor.startSandboxExitMonitor(context.Background(), sb.ID, exitCh)
+		c.startSandboxExitMonitor(context.Background(), sb.ID, exitCh)
 	}
 	// Recover all containers.
 	containers, err := c.client.Containers(ctx, filterLabel(crilabels.ContainerKindLabel, crilabels.ContainerKindContainer))
@@ -172,7 +167,6 @@ func (c *criService) recover(ctx context.Context) error {
 	}
 	eg, ctx2 = errgroup.WithContext(ctx)
 	for _, container := range containers {
-		container := container
 		eg.Go(func() error {
 			cntr, err := c.loadContainer(ctx2, container)
 			if err != nil {
@@ -259,7 +253,6 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 	defer cancel()
 	id := cntr.ID()
 	containerDir := c.getContainerRootDir(id)
-	volatileContainerDir := c.getVolatileContainerRootDir(id)
 	var container containerstore.Container
 	// Load container metadata.
 	exts, err := cntr.Extensions(ctx)
@@ -338,9 +331,7 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 				// NOTE: Another possibility is that we've tried to start the container, but
 				// containerd got restarted during that. In that case, we still
 				// treat the container as `CREATED`.
-				containerIO, err = cio.NewContainerIO(id,
-					cio.WithNewFIFOs(volatileContainerDir, meta.Config.GetTty(), meta.Config.GetStdin()),
-				)
+				containerIO, err = c.createContainerIO(id, meta.SandboxID, meta.Config)
 				if err != nil {
 					return fmt.Errorf("failed to create container io: %w", err)
 				}
@@ -393,7 +384,7 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 					status.Reason = unknownExitReason
 				} else {
 					// Start exit monitor.
-					c.eventMonitor.startContainerExitMonitor(context.Background(), id, status.Pid, exitCh)
+					c.startContainerExitMonitor(context.Background(), id, status.Pid, exitCh)
 				}
 			case containerd.Stopped:
 				// Task is stopped. Update status and delete the task.
@@ -466,4 +457,32 @@ func cleanupOrphanedIDDirs(ctx context.Context, cntrs []containerd.Container, ba
 		}
 	}
 	return nil
+}
+
+func (c *criService) createContainerIO(containerID, sandboxID string, config *runtime.ContainerConfig) (*cio.ContainerIO, error) {
+	if config == nil {
+		return nil, fmt.Errorf("ContainerConfig should not be nil when create container io")
+	}
+	sb, err := c.sandboxStore.Get(sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("an error occurred when try to find sandbox %q: %w", sandboxID, err)
+	}
+	ociRuntime, err := c.config.GetSandboxRuntime(sb.Config, sb.Metadata.RuntimeHandler)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
+	}
+	var containerIO *cio.ContainerIO
+	switch ociRuntime.IOType {
+	case criconfig.IOTypeStreaming:
+		containerIO, err = cio.NewContainerIO(containerID,
+			cio.WithStreams(sb.Endpoint.Address, config.GetTty(), config.GetStdin()))
+	default:
+		volatileContainerRootDir := c.getVolatileContainerRootDir(containerID)
+		containerIO, err = cio.NewContainerIO(containerID,
+			cio.WithNewFIFOs(volatileContainerRootDir, config.GetTty(), config.GetStdin()))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create container io: %w", err)
+	}
+	return containerIO, nil
 }
