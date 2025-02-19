@@ -70,7 +70,7 @@ func TestGeneralContainerSpec(t *testing.T) {
 	c := newTestCRIService()
 	testSandboxID := "sandbox-id"
 	testContainerName := "container-name"
-	spec, err := c.buildContainerSpec(currentPlatform, testID, testSandboxID, testPid, "", testContainerName, testImageName, containerConfig, sandboxConfig, imageConfig, nil, ociRuntime)
+	spec, err := c.buildContainerSpec(currentPlatform, testID, testSandboxID, testPid, "", testContainerName, testImageName, containerConfig, sandboxConfig, imageConfig, nil, ociRuntime, nil)
 	require.NoError(t, err)
 	specCheck(t, testID, testSandboxID, testPid, spec)
 }
@@ -135,7 +135,6 @@ func TestPodAnnotationPassthroughContainerSpec(t *testing.T) {
 			},
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			c := newTestCRIService()
 			containerConfig, sandboxConfig, imageConfig, specCheck := getCreateContainerTestData()
@@ -147,7 +146,7 @@ func TestPodAnnotationPassthroughContainerSpec(t *testing.T) {
 				PodAnnotations: test.podAnnotations,
 			}
 			spec, err := c.buildContainerSpec(currentPlatform, testID, testSandboxID, testPid, "", testContainerName, testImageName,
-				containerConfig, sandboxConfig, imageConfig, nil, ociRuntime)
+				containerConfig, sandboxConfig, imageConfig, nil, ociRuntime, nil)
 			assert.NoError(t, err)
 			assert.NotNil(t, spec)
 			specCheck(t, testID, testSandboxID, testPid, spec)
@@ -209,7 +208,6 @@ func TestContainerSpecCommand(t *testing.T) {
 			expectErr: true,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			config, _, imageConfig, _ := getCreateContainerTestData()
 			config.Command = test.criEntrypoint
@@ -241,7 +239,7 @@ func TestVolumeMounts(t *testing.T) {
 
 	for _, test := range []struct {
 		desc              string
-		platform          platforms.Platform
+		platform          imagespec.Platform
 		criMounts         []*runtime.Mount
 		usernsEnabled     bool
 		imageVolumes      map[string]struct{}
@@ -293,7 +291,7 @@ func TestVolumeMounts(t *testing.T) {
 		},
 		{
 			desc:     "should make relative paths absolute on Linux",
-			platform: platforms.Platform{OS: "linux"},
+			platform: imagespec.Platform{OS: "linux"},
 			imageVolumes: map[string]struct{}{
 				"./test-volume-1":     {},
 				"C:/test-volume-2":    {},
@@ -309,7 +307,7 @@ func TestVolumeMounts(t *testing.T) {
 		},
 		{
 			desc:          "should include mappings for image volumes on Linux",
-			platform:      platforms.Platform{OS: "linux"},
+			platform:      imagespec.Platform{OS: "linux"},
 			usernsEnabled: true,
 			imageVolumes: map[string]struct{}{
 				"/test-volume-1/": {},
@@ -323,7 +321,7 @@ func TestVolumeMounts(t *testing.T) {
 		},
 		{
 			desc:          "should NOT include mappings for image volumes on Linux if !userns",
-			platform:      platforms.Platform{OS: "linux"},
+			platform:      imagespec.Platform{OS: "linux"},
 			usernsEnabled: false,
 			imageVolumes: map[string]struct{}{
 				"/test-volume-1/": {},
@@ -336,7 +334,7 @@ func TestVolumeMounts(t *testing.T) {
 		},
 		{
 			desc:          "should convert rel imageVolume paths to abs paths and add userns mappings",
-			platform:      platforms.Platform{OS: "linux"},
+			platform:      imagespec.Platform{OS: "linux"},
 			usernsEnabled: true,
 			imageVolumes: map[string]struct{}{
 				"test-volume-1/":       {},
@@ -351,7 +349,6 @@ func TestVolumeMounts(t *testing.T) {
 			expectedMappings: idmap,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			config := &imagespec.ImageConfig{
 				Volumes: test.imageVolumes,
@@ -497,7 +494,6 @@ func TestContainerAnnotationPassthroughContainerSpec(t *testing.T) {
 			},
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			c := newTestCRIService()
 			containerConfig, sandboxConfig, imageConfig, specCheck := getCreateContainerTestData()
@@ -512,7 +508,7 @@ func TestContainerAnnotationPassthroughContainerSpec(t *testing.T) {
 				ContainerAnnotations: test.containerAnnotations,
 			}
 			spec, err := c.buildContainerSpec(currentPlatform, testID, testSandboxID, testPid, "", testContainerName, testImageName,
-				containerConfig, sandboxConfig, imageConfig, nil, ociRuntime)
+				containerConfig, sandboxConfig, imageConfig, nil, ociRuntime, nil)
 			assert.NoError(t, err)
 			assert.NotNil(t, spec)
 			specCheck(t, testID, testSandboxID, testPid, spec)
@@ -733,35 +729,23 @@ func TestLinuxContainerMounts(t *testing.T) {
 			expectedMounts:  nil,
 		},
 		{
-			desc: "should skip hostname mount if the old sandbox doesn't have hostname file",
+			desc: "should skip sandbox mounts if the old sandbox doesn't have sandbox file",
 			statFn: func(path string) (os.FileInfo, error) {
-				assert.Equal(t, filepath.Join(testRootDir, sandboxesDir, testSandboxID, "hostname"), path)
-				return nil, errors.New("random error")
+				sandboxRootDir := filepath.Join(testRootDir, sandboxesDir, testSandboxID)
+				sandboxStateDir := filepath.Join(testStateDir, sandboxesDir, testSandboxID)
+				switch path {
+				case filepath.Join(sandboxRootDir, "hostname"), filepath.Join(sandboxRootDir, "hosts"),
+					filepath.Join(sandboxRootDir, "resolv.conf"), filepath.Join(sandboxStateDir, "shm"):
+					return nil, errors.New("random error")
+				default:
+					t.Fatalf("expected sandbox files, got: %s", path)
+				}
+				return nil, nil
 			},
 			securityContext: &runtime.LinuxContainerSecurityContext{},
-			expectedMounts: []*runtime.Mount{
-				{
-					ContainerPath:  "/etc/hosts",
-					HostPath:       filepath.Join(testRootDir, sandboxesDir, testSandboxID, "hosts"),
-					Readonly:       false,
-					SelinuxRelabel: true,
-				},
-				{
-					ContainerPath:  resolvConfPath,
-					HostPath:       filepath.Join(testRootDir, sandboxesDir, testSandboxID, "resolv.conf"),
-					Readonly:       false,
-					SelinuxRelabel: true,
-				},
-				{
-					ContainerPath:  "/dev/shm",
-					HostPath:       filepath.Join(testStateDir, sandboxesDir, testSandboxID, "shm"),
-					Readonly:       false,
-					SelinuxRelabel: true,
-				},
-			},
+			expectedMounts:  nil,
 		},
 	} {
-		test := test
 		t.Run(test.desc, func(t *testing.T) {
 			config := &runtime.ContainerConfig{
 				Metadata: &runtime.ContainerMetadata{

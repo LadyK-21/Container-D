@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd/v2/api/services/tasks/v1"
+	"github.com/containerd/containerd/api/services/tasks/v1"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
@@ -49,5 +49,5 @@ func (c *criService) ContainerStats(ctx context.Context, in *runtime.ContainerSt
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode container metrics: %w", err)
 	}
-	return &runtime.ContainerStatsResponse{Stats: cs}, nil
+	return &runtime.ContainerStatsResponse{Stats: cs.stats}, nil
 }

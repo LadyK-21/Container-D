@@ -17,6 +17,7 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,9 +31,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
-
-// maxResets is the no.of times the Copy() method can tolerate a reset of the body
-const maxResets = 5
 
 var ErrReset = errors.New("writer has been reset")
 
@@ -53,6 +51,31 @@ func NewReader(ra ReaderAt) io.Reader {
 		return rd.Reader()
 	}
 	return io.NewSectionReader(ra, 0, ra.Size())
+}
+
+type nopCloserBytesReader struct {
+	*bytes.Reader
+}
+
+func (*nopCloserBytesReader) Close() error { return nil }
+
+type nopCloserSectionReader struct {
+	*io.SectionReader
+}
+
+func (*nopCloserSectionReader) Close() error { return nil }
+
+// BlobReadSeeker returns a read seeker for the blob from the provider.
+func BlobReadSeeker(ctx context.Context, provider Provider, desc ocispec.Descriptor) (io.ReadSeekCloser, error) {
+	if int64(len(desc.Data)) == desc.Size && digest.FromBytes(desc.Data) == desc.Digest {
+		return &nopCloserBytesReader{bytes.NewReader(desc.Data)}, nil
+	}
+
+	ra, err := provider.ReaderAt(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+	return &nopCloserSectionReader{io.NewSectionReader(ra, 0, ra.Size())}, nil
 }
 
 // ReadBlob retrieves the entire contents of the blob from the provider.
@@ -149,7 +172,7 @@ func OpenWriter(ctx context.Context, cs Ingester, opts ...WriterOpt) (Writer, er
 // Copy is buffered, so no need to wrap reader in buffered io.
 func Copy(ctx context.Context, cw Writer, or io.Reader, size int64, expected digest.Digest, opts ...Opt) error {
 	r := or
-	for i := 0; i < maxResets; i++ {
+	for i := 0; ; i++ {
 		if i >= 1 {
 			log.G(ctx).WithField("digest", expected).Debugf("retrying copy due to reset")
 		}
@@ -189,9 +212,6 @@ func Copy(ctx context.Context, cw Writer, or io.Reader, size int64, expected dig
 		}
 		return nil
 	}
-
-	log.G(ctx).WithField("digest", expected).Errorf("failed to copy after %d retries", maxResets)
-	return fmt.Errorf("failed to copy after %d retries", maxResets)
 }
 
 // CopyReaderAt copies to a writer from a given reader at for the given

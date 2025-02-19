@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	cgroups "github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/log"
 	metrics "github.com/docker/go-metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -98,7 +99,6 @@ func (o *oomCollector) Collect(ch chan<- prometheus.Metric) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, t := range o.set {
-		t := t
 		c := atomic.LoadInt64(&t.count)
 		ch <- prometheus.MustNewConstMetric(o.desc, prometheus.CounterValue, float64(c), t.id, t.namespace)
 	}
@@ -110,16 +110,20 @@ func (o *oomCollector) Close() error {
 }
 
 func (o *oomCollector) start() {
-	var events [128]unix.EpollEvent
+	var (
+		n      int
+		err    error
+		events [128]unix.EpollEvent
+	)
 	for {
-		n, err := unix.EpollWait(o.fd, events[:], -1)
-		if err != nil {
-			if err == unix.EINTR {
-				continue
-			}
+		if err := sys.IgnoringEINTR(func() error {
+			n, err = unix.EpollWait(o.fd, events[:], -1)
+			return err
+		}); err != nil {
 			log.L.WithError(err).Error("cgroups: epoll wait failed, OOM notifications disabled")
 			return
 		}
+
 		for i := 0; i < n; i++ {
 			o.process(uintptr(events[i].Fd))
 		}

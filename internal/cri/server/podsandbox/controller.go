@@ -24,27 +24,29 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
-	eventtypes "github.com/containerd/containerd/v2/api/events"
+	eventtypes "github.com/containerd/containerd/api/events"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/sandbox"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/constants"
+	"github.com/containerd/containerd/v2/internal/cri/server/events"
 	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox/types"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	osinterface "github.com/containerd/containerd/v2/pkg/os"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
 	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/containerd/v2/protobuf"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 )
 
 func init() {
 	registry.Register(&plugin.Registration{
-		Type: plugins.SandboxControllerPlugin,
+		Type: plugins.PodSandboxPlugin,
 		ID:   "podsandbox",
 		Requires: []plugin.Type{
 			plugins.EventPlugin,
@@ -85,16 +87,17 @@ func init() {
 				imageService:   criImagePlugin.(ImageService),
 				store:          NewStore(),
 			}
+
+			eventMonitor := events.NewEventMonitor(&podSandboxEventHandler{
+				controller: &c,
+			})
+			eventMonitor.Subscribe(client, []string{`topic=="/tasks/exit"`})
+			eventMonitor.Start()
+			c.eventMonitor = eventMonitor
+
 			return &c, nil
 		},
 	})
-}
-
-// CRIService interface contains things required by controller, but not yet refactored from criService.
-// TODO: this will be removed in subsequent iterations.
-type CRIService interface {
-	// TODO: we should implement Event backoff in Controller.
-	BackOffEvent(id string, event interface{})
 }
 
 // RuntimeService specifies dependencies to CRI runtime service.
@@ -123,21 +126,16 @@ type Controller struct {
 	imageService ImageService
 	// os is an interface for all required os operations.
 	os osinterface.OS
-	// cri is CRI service that provides missing gaps needed by controller.
-	cri CRIService
+	// eventMonitor is the event monitor for podsandbox controller to handle sandbox task exit event
+	// actually we only use it's backoff mechanism to make sure pause container is cleaned up.
+	eventMonitor *events.EventMonitor
 
 	store *Store
 }
 
-func (c *Controller) Init(
-	cri CRIService,
-) {
-	c.cri = cri
-}
-
 var _ sandbox.Controller = (*Controller)(nil)
 
-func (c *Controller) Platform(_ctx context.Context, _sandboxID string) (platforms.Platform, error) {
+func (c *Controller) Platform(_ctx context.Context, _sandboxID string) (imagespec.Platform, error) {
 	return platforms.DefaultSpec(), nil
 }
 
@@ -158,10 +156,18 @@ func (c *Controller) Wait(ctx context.Context, sandboxID string) (sandbox.ExitSt
 
 }
 
-func (c *Controller) waitSandboxExit(ctx context.Context, p *types.PodSandbox, exitCh <-chan containerd.ExitStatus) (exitStatus uint32, exitedAt time.Time, err error) {
+func (c *Controller) Update(
+	ctx context.Context,
+	sandboxID string,
+	sandbox sandbox.Sandbox,
+	fields ...string) error {
+	return nil
+}
+
+func (c *Controller) waitSandboxExit(ctx context.Context, p *types.PodSandbox, exitCh <-chan containerd.ExitStatus) error {
 	select {
 	case e := <-exitCh:
-		exitStatus, exitedAt, err = e.Result()
+		exitStatus, exitedAt, err := e.Result()
 		if err != nil {
 			log.G(ctx).WithError(err).Errorf("failed to get task exit status for %q", p.ID)
 			exitStatus = unknownExitCode
@@ -171,12 +177,12 @@ func (c *Controller) waitSandboxExit(ctx context.Context, p *types.PodSandbox, e
 		dctx, dcancel := context.WithTimeout(dctx, handleEventTimeout)
 		defer dcancel()
 		event := &eventtypes.TaskExit{ExitStatus: exitStatus, ExitedAt: protobuf.ToTimestamp(exitedAt)}
-		if cleanErr := handleSandboxTaskExit(dctx, p, event); cleanErr != nil {
-			c.cri.BackOffEvent(p.ID, e)
+		if err := handleSandboxTaskExit(dctx, p, event); err != nil {
+			c.eventMonitor.Backoff(p.ID, event)
 		}
-		return
+		return nil
 	case <-ctx.Done():
-		return unknownExitCode, time.Now(), ctx.Err()
+		return ctx.Err()
 	}
 }
 
@@ -195,6 +201,9 @@ func handleSandboxTaskExit(ctx context.Context, sb *types.PodSandbox, e *eventty
 				return fmt.Errorf("failed to stop sandbox: %w", err)
 			}
 		}
+	}
+	if err := sb.Exit(e.ExitStatus, protobuf.FromTimestamp(e.ExitedAt)); err != nil {
+		return err
 	}
 	return nil
 }

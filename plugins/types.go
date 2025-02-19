@@ -38,7 +38,9 @@ const (
 	// SnapshotPlugin implements a snapshotter
 	SnapshotPlugin plugin.Type = "io.containerd.snapshotter.v1"
 	// TaskMonitorPlugin implements a task monitor
-	TaskMonitorPlugin plugin.Type = "io.containerd.monitor.v1"
+	TaskMonitorPlugin plugin.Type = "io.containerd.monitor.task.v1"
+	// TaskMonitorPlugin implements a container monitor
+	ContainerMonitorPlugin plugin.Type = "io.containerd.monitor.container.v1"
 	// DiffPlugin implements a differ
 	DiffPlugin plugin.Type = "io.containerd.differ.v1"
 	// MetadataPlugin implements a metadata store
@@ -61,6 +63,8 @@ const (
 	TransferPlugin plugin.Type = "io.containerd.transfer.v1"
 	// SandboxStorePlugin implements a sandbox store
 	SandboxStorePlugin plugin.Type = "io.containerd.sandbox.store.v1"
+	// PodSandboxPlugin is a special sandbox controller which use pause container as a sandbox.
+	PodSandboxPlugin plugin.Type = "io.containerd.podsandbox.controller.v1"
 	// SandboxControllerPlugin implements a sandbox controller
 	SandboxControllerPlugin plugin.Type = "io.containerd.sandbox.controller.v1"
 	// ImageVerifierPlugin implements an image verifier service
@@ -69,6 +73,10 @@ const (
 	WarningPlugin plugin.Type = "io.containerd.warning.v1"
 	// CRIServicePlugin implements a cri service
 	CRIServicePlugin plugin.Type = "io.containerd.cri.v1"
+	// ShimPlugin implements a shim service
+	ShimPlugin plugin.Type = "io.containerd.shim.v1"
+	// HTTPHandler implements an http handler
+	HTTPHandler plugin.Type = "io.containerd.http.v1"
 )
 
 const (
@@ -88,6 +96,10 @@ const (
 	PropertyStateDir = "io.containerd.plugin.state"
 	// PropertyGRPCAddress is the grpc address used for client connections to containerd
 	PropertyGRPCAddress = "io.containerd.plugin.grpc.address"
-	// PropertyGRPCAddress is the ttrpc address used for client connections to containerd
+	// PropertyTTRPCAddress is the ttrpc address used for client connections to containerd
 	PropertyTTRPCAddress = "io.containerd.plugin.ttrpc.address"
+)
+
+const (
+	SnapshotterRootDir = "root"
 )

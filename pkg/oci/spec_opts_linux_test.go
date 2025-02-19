@@ -24,8 +24,8 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/containers"
-	"github.com/containerd/containerd/v2/internal/testutil"
 	"github.com/containerd/containerd/v2/pkg/cap"
+	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/continuity/fs/fstest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
@@ -71,7 +71,6 @@ guest:x:405:100:guest:/dev/null:/sbin/nologin
 		},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(fmt.Sprintf("user %d", testCase.userID), func(t *testing.T) {
 			t.Parallel()
 			s := Spec{
@@ -131,7 +130,6 @@ guest:x:405:100:guest:/dev/null:/sbin/nologin
 		},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.user, func(t *testing.T) {
 			t.Parallel()
 			s := Spec{
@@ -201,7 +199,6 @@ sys:x:3:root,bin,adm
 		},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.user, func(t *testing.T) {
 			t.Parallel()
 			s := Spec{
@@ -605,7 +602,6 @@ daemon:x:2:root,bin,daemon
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			s := Spec{
@@ -663,7 +659,6 @@ func TestWithAppendAdditionalGroupsNoEtcGroup(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 			s := Spec{

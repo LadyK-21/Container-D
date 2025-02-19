@@ -21,28 +21,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	containersapi "github.com/containerd/containerd/v2/api/services/containers/v1"
-	contentapi "github.com/containerd/containerd/v2/api/services/content/v1"
-	diffapi "github.com/containerd/containerd/v2/api/services/diff/v1"
-	eventsapi "github.com/containerd/containerd/v2/api/services/events/v1"
-	imagesapi "github.com/containerd/containerd/v2/api/services/images/v1"
-	introspectionapi "github.com/containerd/containerd/v2/api/services/introspection/v1"
-	leasesapi "github.com/containerd/containerd/v2/api/services/leases/v1"
-	namespacesapi "github.com/containerd/containerd/v2/api/services/namespaces/v1"
-	sandboxsapi "github.com/containerd/containerd/v2/api/services/sandbox/v1"
-	snapshotsapi "github.com/containerd/containerd/v2/api/services/snapshots/v1"
-	"github.com/containerd/containerd/v2/api/services/tasks/v1"
-	versionservice "github.com/containerd/containerd/v2/api/services/version/v1"
-	apitypes "github.com/containerd/containerd/v2/api/types"
+	"google.golang.org/grpc/resolver"
+
+	containersapi "github.com/containerd/containerd/api/services/containers/v1"
+	diffapi "github.com/containerd/containerd/api/services/diff/v1"
+	imagesapi "github.com/containerd/containerd/api/services/images/v1"
+	leasesapi "github.com/containerd/containerd/api/services/leases/v1"
+	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
+	sandboxsapi "github.com/containerd/containerd/api/services/sandbox/v1"
+	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
+	"github.com/containerd/containerd/api/services/tasks/v1"
+	versionservice "github.com/containerd/containerd/api/services/version/v1"
+	apitypes "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
 	contentproxy "github.com/containerd/containerd/v2/core/content/proxy"
+	"github.com/containerd/containerd/v2/core/events"
+	eventsproxy "github.com/containerd/containerd/v2/core/events/proxy"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/introspection"
+	introspectionproxy "github.com/containerd/containerd/v2/core/introspection/proxy"
 	"github.com/containerd/containerd/v2/core/leases"
 	leasesproxy "github.com/containerd/containerd/v2/core/leases/proxy"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -53,12 +57,10 @@ import (
 	snproxy "github.com/containerd/containerd/v2/core/snapshots/proxy"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/dialer"
-	"github.com/containerd/containerd/v2/pkg/events"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/containerd/v2/plugins/services/introspection"
-	"github.com/containerd/containerd/v2/protobuf"
-	ptypes "github.com/containerd/containerd/v2/protobuf/types"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
@@ -81,6 +83,14 @@ func init() {
 	typeurl.Register(&specs.LinuxResources{}, prefix, "opencontainers/runtime-spec", major, "LinuxResources")
 	typeurl.Register(&specs.WindowsResources{}, prefix, "opencontainers/runtime-spec", major, "WindowsResources")
 	typeurl.Register(&features.Features{}, prefix, "opencontainers/runtime-spec", major, "features", "Features")
+
+	if runtime.GOOS == "windows" {
+		// After bumping GRPC to 1.64, Windows tests started failing with: "name resolver error: produced zero addresses".
+		// This is happening because grpc.NewClient uses DNS resolver by default, which apparently not what we want
+		// when using socket paths on Windows.
+		// Using a workaround from https://github.com/grpc/grpc-go/issues/1786#issuecomment-2119088770
+		resolver.SetDefaultScheme("passthrough")
+	}
 }
 
 // New returns a new containerd client that is connected to the containerd
@@ -117,21 +127,20 @@ func New(address string, opts ...Opt) (*Client, error) {
 	}
 	if address != "" {
 		backoffConfig := backoff.DefaultConfig
-		backoffConfig.MaxDelay = 3 * time.Second
+		backoffConfig.MaxDelay = copts.timeout
 		connParams := grpc.ConnectParams{
 			Backoff: backoffConfig,
 		}
 		gopts := []grpc.DialOption{
-			grpc.WithBlock(),
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.FailOnNonTempDialError(true),
 			grpc.WithConnectParams(connParams),
 			grpc.WithContextDialer(dialer.ContextDialer),
-			grpc.WithReturnConnectionError(),
 		}
 		if len(copts.dialOptions) > 0 {
 			gopts = copts.dialOptions
 		}
+		gopts = append(gopts, copts.extraDialOpts...)
+
 		gopts = append(gopts, grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 			grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)))
@@ -145,9 +154,7 @@ func New(address string, opts ...Opt) (*Client, error) {
 		}
 
 		connector := func() (*grpc.ClientConn, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), copts.timeout)
-			defer cancel()
-			conn, err := grpc.DialContext(ctx, dialer.DialAddress(address), gopts...)
+			conn, err := grpc.NewClient(dialer.DialAddress(address), gopts...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to dial %q: %w", address, err)
 			}
@@ -270,9 +277,9 @@ func (c *Client) Containers(ctx context.Context, filters ...string) ([]Container
 	if err != nil {
 		return nil, err
 	}
-	var out []Container
-	for _, container := range r {
-		out = append(out, containerFromRecord(c, container))
+	out := make([]Container, len(r))
+	for i, container := range r {
+		out[i] = containerFromRecord(c, container)
 	}
 	return out, nil
 }
@@ -280,6 +287,8 @@ func (c *Client) Containers(ctx context.Context, filters ...string) ([]Container
 // NewContainer will create a new container with the provided id.
 // The id must be unique within the namespace.
 func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContainerOpts) (Container, error) {
+	ctx, span := tracing.StartSpan(ctx, "client.NewContainer")
+	defer span.End()
 	ctx, done, err := c.WithLease(ctx)
 	if err != nil {
 		return nil, err
@@ -297,6 +306,13 @@ func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContain
 			return nil, err
 		}
 	}
+
+	span.SetAttributes(
+		tracing.Attribute("container.id", container.ID),
+		tracing.Attribute("container.image.ref", container.Image),
+		tracing.Attribute("container.runtime.name", container.Runtime.Name),
+		tracing.Attribute("container.snapshotter.name", container.Snapshotter),
+	)
 	r, err := c.ContainerService().Create(ctx, container)
 	if err != nil {
 		return nil, err
@@ -306,10 +322,21 @@ func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContain
 
 // LoadContainer loads an existing container from metadata
 func (c *Client) LoadContainer(ctx context.Context, id string) (Container, error) {
+	ctx, span := tracing.StartSpan(ctx, "client.LoadContainer")
+	defer span.End()
 	r, err := c.ContainerService().Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+
+	span.SetAttributes(
+		tracing.Attribute("container.id", r.ID),
+		tracing.Attribute("container.image.ref", r.Image),
+		tracing.Attribute("container.runtime.name", r.Runtime.Name),
+		tracing.Attribute("container.snapshotter.name", r.Snapshotter),
+		tracing.Attribute("container.createdAt", r.CreatedAt.Format(time.RFC3339)),
+		tracing.Attribute("container.updatedAt", r.UpdatedAt.Format(time.RFC3339)),
+	)
 	return containerFromRecord(c, r), nil
 }
 
@@ -515,9 +542,9 @@ func (c *Client) Restore(ctx context.Context, id string, checkpoint Image, opts 
 	}
 	defer done(ctx)
 
-	copts := []NewContainerOpts{}
-	for _, o := range opts {
-		copts = append(copts, o(ctx, id, c, checkpoint, index))
+	copts := make([]NewContainerOpts, len(opts))
+	for i, o := range opts {
+		copts[i] = o(ctx, id, c, checkpoint, index)
 	}
 
 	ctr, err := c.NewContainer(ctx, id, copts...)
@@ -622,7 +649,7 @@ func (c *Client) ContentStore() content.Store {
 	}
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	return contentproxy.NewContentStore(contentapi.NewContentClient(c.conn))
+	return contentproxy.NewContentStore(c.conn)
 }
 
 // SnapshotService returns the underlying snapshotter for the provided snapshotter name
@@ -681,7 +708,7 @@ func (c *Client) IntrospectionService() introspection.Service {
 	}
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	return introspection.NewIntrospectionServiceFromClient(introspectionapi.NewIntrospectionClient(c.conn))
+	return introspectionproxy.NewIntrospectionProxy(c.conn)
 }
 
 // LeasesService returns the underlying Leases Client
@@ -708,7 +735,7 @@ func (c *Client) EventService() EventService {
 	}
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	return NewEventServiceFromClient(eventsapi.NewEventsClient(c.conn))
+	return eventsproxy.NewRemoteEvents(c.conn)
 }
 
 // SandboxStore returns the underlying sandbox store client
@@ -728,7 +755,7 @@ func (c *Client) SandboxController(name string) sandbox.Controller {
 	}
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	return sandboxproxy.NewSandboxController(sandboxsapi.NewControllerClient(c.conn))
+	return sandboxproxy.NewSandboxController(sandboxsapi.NewControllerClient(c.conn), name)
 }
 
 // VersionService returns the underlying VersionClient
@@ -738,8 +765,9 @@ func (c *Client) VersionService() versionservice.VersionClient {
 	return versionservice.NewVersionClient(c.conn)
 }
 
-// Conn returns the underlying GRPC connection object
-func (c *Client) Conn() *grpc.ClientConn {
+// Conn returns the underlying RPC connection object
+// Either *grpc.ClientConn or *ttrpc.Conn
+func (c *Client) Conn() any {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 	return c.conn
@@ -785,7 +813,7 @@ func (c *Client) Server(ctx context.Context) (ServerInfo, error) {
 	}
 	c.connMu.Unlock()
 
-	response, err := c.IntrospectionService().Server(ctx, &ptypes.Empty{})
+	response, err := c.IntrospectionService().Server(ctx)
 	if err != nil {
 		return ServerInfo{}, err
 	}
@@ -831,7 +859,7 @@ func (c *Client) GetSnapshotterSupportedPlatforms(ctx context.Context, snapshott
 	filters := []string{fmt.Sprintf("type==%s, id==%s", plugins.SnapshotPlugin, snapshotterName)}
 	in := c.IntrospectionService()
 
-	resp, err := in.Plugins(ctx, filters)
+	resp, err := in.Plugins(ctx, filters...)
 	if err != nil {
 		return nil, err
 	}
@@ -862,7 +890,7 @@ func (c *Client) GetSnapshotterCapabilities(ctx context.Context, snapshotterName
 	filters := []string{fmt.Sprintf("type==%s, id==%s", plugins.SnapshotPlugin, snapshotterName)}
 	in := c.IntrospectionService()
 
-	resp, err := in.Plugins(ctx, filters)
+	resp, err := in.Plugins(ctx, filters...)
 	if err != nil {
 		return nil, err
 	}
@@ -898,25 +926,15 @@ func (c *Client) RuntimeInfo(ctx context.Context, runtimePath string, runtimeOpt
 	}
 	var err error
 	if runtimeOptions != nil {
-		rr.Options, err = protobuf.MarshalAnyToProto(runtimeOptions)
+		rr.Options, err = typeurl.MarshalAnyToProto(runtimeOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal %T: %w", runtimeOptions, err)
 		}
 	}
-	options, err := protobuf.MarshalAnyToProto(rr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal runtime requst: %w", err)
-	}
 
 	s := c.IntrospectionService()
 
-	req := &introspectionapi.PluginInfoRequest{
-		Type:    string(plugins.RuntimePluginV2),
-		ID:      "task",
-		Options: options,
-	}
-
-	resp, err := s.PluginInfo(ctx, req)
+	resp, err := s.PluginInfo(ctx, string(plugins.RuntimePluginV2), "task", rr)
 	if err != nil {
 		return nil, err
 	}

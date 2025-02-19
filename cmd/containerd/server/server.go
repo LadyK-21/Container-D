@@ -37,19 +37,23 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
 	"github.com/docker/go-metrics"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
-	csapi "github.com/containerd/containerd/v2/api/services/content/v1"
-	diffapi "github.com/containerd/containerd/v2/api/services/diff/v1"
-	sbapi "github.com/containerd/containerd/v2/api/services/sandbox/v1"
-	ssapi "github.com/containerd/containerd/v2/api/services/snapshots/v1"
+	diffapi "github.com/containerd/containerd/api/services/diff/v1"
+	sbapi "github.com/containerd/containerd/api/services/sandbox/v1"
+	ssapi "github.com/containerd/containerd/api/services/snapshots/v1"
+	"github.com/containerd/platforms"
+	"github.com/containerd/plugin"
+	"github.com/containerd/plugin/dynamic"
+	"github.com/containerd/plugin/registry"
+
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	csproxy "github.com/containerd/containerd/v2/core/content/proxy"
 	"github.com/containerd/containerd/v2/core/diff"
@@ -62,13 +66,8 @@ import (
 	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/containerd/v2/pkg/timeout"
 	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
 	"github.com/containerd/containerd/v2/version"
-	"github.com/containerd/platforms"
-	"github.com/containerd/plugin"
-	"github.com/containerd/plugin/dynamic"
-	"github.com/containerd/plugin/registry"
 )
 
 // CreateTopLevelDirectories creates the top-level root and state directories.
@@ -88,6 +87,15 @@ func CreateTopLevelDirectories(config *srvconfig.Config) error {
 
 	if err := sys.MkdirAllWithACL(config.State, 0o711); err != nil {
 		return err
+	}
+	if config.State != defaults.DefaultStateDir {
+		// XXX: socketRoot in pkg/shim is hard-coded to the default state directory.
+		// See https://github.com/containerd/containerd/issues/10502#issuecomment-2249268582 for why it's set up that way.
+		// The default fifo directory in pkg/cio is also configured separately and defaults to the default state directory instead of the configured state directory.
+		// Make sure the default state directory is created with the correct permissions.
+		if err := sys.MkdirAllWithACL(defaults.DefaultStateDir, 0o711); err != nil {
+			return err
+		}
 	}
 
 	if config.TempDir != "" {
@@ -144,16 +152,25 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 		diff.RegisterProcessor(diff.BinaryHandler(id, p.Returns, p.Accepts, p.Path, p.Args, p.Env))
 	}
 
+	var prometheusServerMetricsOpts []grpc_prometheus.ServerMetricsOption
+	if config.Metrics.GRPCHistogram {
+		// Enable grpc time histograms to measure rpc latencies
+		prometheusServerMetricsOpts = append(prometheusServerMetricsOpts, grpc_prometheus.WithServerHandlingTimeHistogram())
+	}
+
+	prometheusServerMetrics := grpc_prometheus.NewServerMetrics(prometheusServerMetricsOpts...)
+	prometheus.MustRegister(prometheusServerMetrics)
+
 	serverOpts := []grpc.ServerOption{
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-			grpc_prometheus.StreamServerInterceptor,
+		grpc.ChainStreamInterceptor(
 			streamNamespaceInterceptor,
-		)),
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			grpc_prometheus.UnaryServerInterceptor,
+			prometheusServerMetrics.StreamServerInterceptor(),
+		),
+		grpc.ChainUnaryInterceptor(
 			unaryNamespaceInterceptor,
-		)),
+			prometheusServerMetrics.UnaryServerInterceptor(),
+		),
 	}
 	if config.GRPC.MaxRecvMsgSize > 0 {
 		serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(config.GRPC.MaxRecvMsgSize))
@@ -213,10 +230,11 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 		ttrpcServices []ttrpcService
 
 		s = &Server{
-			grpcServer:  grpcServer,
-			tcpServer:   tcpServer,
-			ttrpcServer: ttrpcServer,
-			config:      config,
+			prometheusServerMetrics: prometheusServerMetrics,
+			grpcServer:              grpcServer,
+			tcpServer:               tcpServer,
+			ttrpcServer:             ttrpcServer,
+			config:                  config,
 		}
 		initialized = plugin.NewPluginSet()
 		required    = make(map[string]struct{})
@@ -364,24 +382,18 @@ func recordConfigDeprecations(ctx context.Context, config *srvconfig.Config, set
 
 // Server is the containerd main daemon
 type Server struct {
-	grpcServer  *grpc.Server
-	ttrpcServer *ttrpc.Server
-	tcpServer   *grpc.Server
-	config      *srvconfig.Config
-	plugins     []*plugin.Plugin
-	ready       sync.WaitGroup
+	prometheusServerMetrics *grpc_prometheus.ServerMetrics
+	grpcServer              *grpc.Server
+	ttrpcServer             *ttrpc.Server
+	tcpServer               *grpc.Server
+	config                  *srvconfig.Config
+	plugins                 []*plugin.Plugin
+	ready                   sync.WaitGroup
 }
 
 // ServeGRPC provides the containerd grpc APIs on the provided listener
 func (s *Server) ServeGRPC(l net.Listener) error {
-	if s.config.Metrics.GRPCHistogram {
-		// enable grpc time histograms to measure rpc latencies
-		grpc_prometheus.EnableHandlingTimeHistogram()
-	}
-	// before we start serving the grpc API register the grpc_prometheus metrics
-	// handler.  This needs to be the last service registered so that it can collect
-	// metrics for every other service
-	grpc_prometheus.Register(s.grpcServer)
+	s.prometheusServerMetrics.InitializeMetrics(s.grpcServer)
 	return trapClosedConnErr(s.grpcServer.Serve(l))
 }
 
@@ -403,7 +415,7 @@ func (s *Server) ServeMetrics(l net.Listener) error {
 
 // ServeTCP allows services to serve over tcp
 func (s *Server) ServeTCP(l net.Listener) error {
-	grpc_prometheus.Register(s.tcpServer)
+	s.prometheusServerMetrics.InitializeMetrics(s.tcpServer)
 	return trapClosedConnErr(s.tcpServer.Serve(l))
 }
 
@@ -470,16 +482,6 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 		config.PluginDir = path //nolint:staticcheck
 		log.G(ctx).Warningf("loaded %d dynamic plugins. `go_plugin` is deprecated, please use `external plugins` instead", count)
 	}
-	// load additional plugins that don't automatically register themselves
-	registry.Register(&plugin.Registration{
-		Type: plugins.ContentPlugin,
-		ID:   "content",
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			root := ic.Properties[plugins.PropertyRootDir]
-			ic.Meta.Exports["root"] = root
-			return local.NewStore(root)
-		},
-	})
 
 	clients := &proxyClients{}
 	for name, pp := range config.ProxyPlugins {
@@ -503,12 +505,12 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 		case string(plugins.ContentPlugin), "content":
 			t = plugins.ContentPlugin
 			f = func(conn *grpc.ClientConn) interface{} {
-				return csproxy.NewContentStore(csapi.NewContentClient(conn))
+				return csproxy.NewContentStore(conn)
 			}
 		case string(plugins.SandboxControllerPlugin), "sandbox":
 			t = plugins.SandboxControllerPlugin
 			f = func(conn *grpc.ClientConn) interface{} {
-				return sbproxy.NewSandboxController(sbapi.NewControllerClient(conn))
+				return sbproxy.NewSandboxController(sbapi.NewControllerClient(conn), name)
 			}
 		case string(plugins.DiffPlugin), "diff":
 			t = plugins.DiffPlugin
@@ -539,6 +541,7 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 			InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 				ic.Meta.Exports = exports
 				ic.Meta.Platforms = append(ic.Meta.Platforms, p)
+				ic.Meta.Capabilities = pp.Capabilities
 				conn, err := clients.getClient(address)
 				if err != nil {
 					return nil, err
@@ -583,7 +586,7 @@ func (pc *proxyClients) getClient(address string) (*grpc.ClientConn, error) {
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
 	}
 
-	conn, err := grpc.Dial(dialer.DialAddress(address), gopts...)
+	conn, err := grpc.NewClient(dialer.DialAddress(address), gopts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial %q: %w", address, err)
 	}

@@ -19,6 +19,12 @@ package transfer
 import (
 	"fmt"
 
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/containerd/plugin"
+	"github.com/containerd/plugin/registry"
+
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/metadata"
@@ -26,11 +32,6 @@ import (
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/pkg/imageverifier"
 	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/containerd/platforms"
-	"github.com/containerd/plugin"
-	"github.com/containerd/plugin/registry"
 
 	// Load packages with type registrations
 	_ "github.com/containerd/containerd/v2/core/transfer/archive"
@@ -48,6 +49,7 @@ func init() {
 			plugins.MetadataPlugin,
 			plugins.DiffPlugin,
 			plugins.ImageVerifierPlugin,
+			plugins.SnapshotPlugin,
 		},
 		Config: defaultConfig(),
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
@@ -57,23 +59,27 @@ func init() {
 				return nil, err
 			}
 			ms := m.(*metadata.DB)
+
+			var lc local.TransferConfig
+
 			l, err := ic.GetSingle(plugins.LeasePlugin)
 			if err != nil {
 				return nil, err
 			}
+			lc.Leases = l.(leases.Manager)
 
-			vfs := make(map[string]imageverifier.ImageVerifier)
 			vps, err := ic.GetByType(plugins.ImageVerifierPlugin)
 			if err != nil {
 				return nil, err
 			}
-
-			for name, vp := range vps {
-				vfs[name] = vp.(imageverifier.ImageVerifier)
+			if len(vps) > 0 {
+				lc.Verifiers = make(map[string]imageverifier.ImageVerifier)
+				for name, vp := range vps {
+					lc.Verifiers[name] = vp.(imageverifier.ImageVerifier)
+				}
 			}
 
 			// Set configuration based on default or user input
-			var lc local.TransferConfig
 			lc.MaxConcurrentDownloads = config.MaxConcurrentDownloads
 			lc.MaxConcurrentUploadedLayers = config.MaxConcurrentUploadedLayers
 
@@ -92,9 +98,13 @@ func init() {
 				if sn == nil {
 					return nil, fmt.Errorf("snapshotter %q not found: %w", uc.Snapshotter, errdefs.ErrNotFound)
 				}
+				var snExports map[string]string
+				if p := ic.Plugins().Get(plugins.SnapshotPlugin, uc.Snapshotter); p != nil {
+					snExports = p.Meta.Exports
+				}
 
 				var applier diff.Applier
-				target := platforms.OnlyStrict(p)
+				target := platforms.Only(p)
 				if uc.Differ != "" {
 					inst, err := ic.GetByID(plugins.DiffPlugin, uc.Differ)
 					if err != nil {
@@ -131,16 +141,17 @@ func init() {
 				}
 
 				up := unpack.Platform{
-					Platform:       target,
-					SnapshotterKey: uc.Snapshotter,
-					Snapshotter:    sn,
-					Applier:        applier,
+					Platform:           target,
+					SnapshotterKey:     uc.Snapshotter,
+					Snapshotter:        sn,
+					SnapshotterExports: snExports,
+					Applier:            applier,
 				}
 				lc.UnpackPlatforms = append(lc.UnpackPlatforms, up)
 			}
 			lc.RegistryConfigPath = config.RegistryConfigPath
 
-			return local.NewTransferService(l.(leases.Manager), ms.ContentStore(), metadata.NewImageStore(ms), vfs, &lc), nil
+			return local.NewTransferService(ms.ContentStore(), metadata.NewImageStore(ms), lc), nil
 		},
 	})
 }
