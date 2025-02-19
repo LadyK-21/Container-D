@@ -45,6 +45,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/pkg/blockio"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/platforms"
 )
 
@@ -55,6 +56,7 @@ func init() {
 
 // CreateContainer creates a new container in the given PodSandbox.
 func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateContainerRequest) (_ *runtime.CreateContainerResponse, retErr error) {
+	span := tracing.SpanFromContext(ctx)
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Container config %+v", config)
 	sandboxConfig := r.GetSandboxConfig()
@@ -63,12 +65,7 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		return nil, fmt.Errorf("failed to find sandbox id %q: %w", r.GetPodSandboxId(), err)
 	}
 
-	controller, err := c.sandboxService.SandboxController(sandbox.Config, sandbox.RuntimeHandler)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sandbox controller: %w", err)
-	}
-
-	cstatus, err := controller.Status(ctx, sandbox.ID, false)
+	cstatus, err := c.sandboxService.SandboxStatus(ctx, sandbox.Sandboxer, sandbox.ID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller status: %w", err)
 	}
@@ -77,7 +74,10 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		sandboxID  = cstatus.SandboxID
 		sandboxPid = cstatus.Pid
 	)
-
+	span.SetAttributes(
+		tracing.Attribute("sandbox.id", sandboxID),
+		tracing.Attribute("sandbox.pid", sandboxPid),
+	)
 	// Generate unique id and name for the container and reserve the name.
 	// Reserve the container name to avoid concurrent `CreateContainer` request creating
 	// the same container.
@@ -92,6 +92,10 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err = c.containerNameIndex.Reserve(name, id); err != nil {
 		return nil, fmt.Errorf("failed to reserve container name %q: %w", name, err)
 	}
+	span.SetAttributes(
+		tracing.Attribute("container.id", id),
+		tracing.Attribute("container.name", name),
+	)
 	defer func() {
 		// Release the name if the function returns with an error.
 		if retErr != nil {
@@ -117,7 +121,9 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err != nil {
 		return nil, fmt.Errorf("failed to get image from containerd %q: %w", image.ID, err)
 	}
-
+	span.SetAttributes(
+		tracing.Attribute("container.image.ref", containerdImage.Name()),
+	)
 	start := time.Now()
 
 	// Create container root directory.
@@ -150,25 +156,43 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		}
 	}()
 
-	platform, err := controller.Platform(ctx, sandboxID)
+	platform, err := c.sandboxService.SandboxPlatform(ctx, sandbox.Sandboxer, sandboxID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sandbox platform: %w", err)
 	}
 
+	ociRuntime, err := c.getPodSandboxRuntime(sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
+	}
+
+	// mutate the extra CRI volume mounts from the runtime spec to properly specify the OCI image volume mount requests as bind mounts for this container
+	err = c.mutateMounts(ctx, config.GetMounts(), c.RuntimeSnapshotter(ctx, ociRuntime), sandboxID, platform)
+	if err != nil {
+		return nil, fmt.Errorf("failed to mount image volume: %w", err)
+	}
+
 	var volumeMounts []*runtime.Mount
 	if !c.config.IgnoreImageDefinedVolumes {
-		// Create container image volumes mounts.
+		// create a list of image volume mounts from the image spec that are not also already in the runtime config volume list
 		volumeMounts = c.volumeMounts(platform, containerRootDir, config, &image.ImageSpec.Config)
 	} else if len(image.ImageSpec.Config.Volumes) != 0 {
 		log.G(ctx).Debugf("Ignoring volumes defined in image %v because IgnoreImageDefinedVolumes is set", image.ID)
 	}
 
-	ociRuntime, err := c.config.GetSandboxRuntime(sandboxConfig, sandbox.Metadata.RuntimeHandler)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get sandbox runtime: %w", err)
+	var runtimeHandler *runtime.RuntimeHandler
+	for _, f := range c.runtimeHandlers {
+		if f.Name == sandbox.Metadata.RuntimeHandler {
+			runtimeHandler = f
+			break
+		}
 	}
 	log.G(ctx).Debugf("Use OCI runtime %+v for sandbox %q and container %q", ociRuntime, sandboxID, id)
 
+	imageName := containerdImage.Name()
+	if name := config.GetImage().GetUserSpecifiedImage(); name != "" {
+		imageName = name
+	}
 	spec, err := c.buildContainerSpec(
 		platform,
 		id,
@@ -176,12 +200,13 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		sandboxPid,
 		sandbox.NetNSPath,
 		containerName,
-		containerdImage.Name(),
+		imageName,
 		config,
 		sandboxConfig,
 		&image.ImageSpec.Config,
 		volumeMounts,
 		ociRuntime,
+		runtimeHandler,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate container %q spec: %w", id, err)
@@ -243,8 +268,15 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 			sandboxConfig.GetLogDirectory(), config.GetLogPath())
 	}
 
-	containerIO, err := cio.NewContainerIO(id,
-		cio.WithNewFIFOs(volatileContainerRootDir, config.GetTty(), config.GetStdin()))
+	var containerIO *cio.ContainerIO
+	switch ociRuntime.IOType {
+	case criconfig.IOTypeStreaming:
+		containerIO, err = cio.NewContainerIO(id,
+			cio.WithStreams(sandbox.Endpoint.Address, config.GetTty(), config.GetStdin()))
+	default:
+		containerIO, err = cio.NewContainerIO(id,
+			cio.WithNewFIFOs(volatileContainerRootDir, config.GetTty(), config.GetStdin()))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container io: %w", err)
 	}
@@ -261,7 +293,7 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		return nil, fmt.Errorf("failed to get container spec opts: %w", err)
 	}
 
-	containerLabels := buildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindContainer)
+	containerLabels := util.BuildLabels(config.Labels, image.ImageSpec.Config.Labels, crilabels.ContainerKindContainer)
 
 	// TODO the sandbox in the cache should hold this info
 	runtimeName, runtimeOption, err := c.runtimeInfo(ctx, sandboxID)
@@ -334,13 +366,16 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 
 	containerCreateTimer.WithValues(ociRuntime.Type).UpdateSince(start)
 
+	span.AddEvent("container created",
+		tracing.Attribute("container.create.duration", time.Since(start).String()),
+	)
 	return &runtime.CreateContainerResponse{ContainerId: id}, nil
 }
 
 // volumeMounts sets up image volumes for container. Rely on the removal of container
 // root directory to do cleanup. Note that image volume will be skipped, if there is criMounts
 // specified with the same destination.
-func (c *criService) volumeMounts(platform platforms.Platform, containerRootDir string, containerConfig *runtime.ContainerConfig, config *imagespec.ImageConfig) []*runtime.Mount {
+func (c *criService) volumeMounts(platform imagespec.Platform, containerRootDir string, containerConfig *runtime.ContainerConfig, config *imagespec.ImageConfig) []*runtime.Mount {
 	var uidMappings, gidMappings []*runtime.IDMapping
 	if platform.OS == "linux" {
 		if usernsOpts := containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetUsernsOptions(); usernsOpts != nil {
@@ -388,7 +423,7 @@ func (c *criService) volumeMounts(platform platforms.Platform, containerRootDir 
 }
 
 // runtimeSpec returns a default runtime spec used in cri-containerd.
-func (c *criService) runtimeSpec(id string, platform platforms.Platform, baseSpecFile string, opts ...oci.SpecOpts) (*runtimespec.Spec, error) {
+func (c *criService) runtimeSpec(id string, platform imagespec.Platform, baseSpecFile string, opts ...oci.SpecOpts) (*runtimespec.Spec, error) {
 	// GenerateSpec needs namespace.
 	ctx := util.NamespacedContext()
 	container := &containers.Container{ID: id}
@@ -471,7 +506,7 @@ func generateUserString(username string, uid, gid *runtime.Int64Value) (string, 
 // runtime information (rootfs mounted), or platform specific checks with
 // no defined workaround (yet) to specify for other platforms.
 func (c *criService) platformSpecOpts(
-	platform platforms.Platform,
+	platform imagespec.Platform,
 	config *runtime.ContainerConfig,
 	imageConfig *imagespec.ImageConfig,
 ) ([]oci.SpecOpts, error) {
@@ -518,7 +553,7 @@ func (c *criService) platformSpecOpts(
 
 // buildContainerSpec build container's OCI spec depending on controller's target platform OS.
 func (c *criService) buildContainerSpec(
-	platform platforms.Platform,
+	platform imagespec.Platform,
 	id string,
 	sandboxID string,
 	sandboxPid uint32,
@@ -530,6 +565,7 @@ func (c *criService) buildContainerSpec(
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
 	ociRuntime criconfig.Runtime,
+	runtimeHandler *runtime.RuntimeHandler,
 ) (_ *runtimespec.Spec, retErr error) {
 	var (
 		specOpts []oci.SpecOpts
@@ -551,7 +587,6 @@ func (c *criService) buildContainerSpec(
 			id,
 			sandboxID,
 			sandboxPid,
-			netNSPath,
 			containerName,
 			imageName,
 			config,
@@ -559,12 +594,11 @@ func (c *criService) buildContainerSpec(
 			imageConfig,
 			append(linuxMounts, extraMounts...),
 			ociRuntime,
+			runtimeHandler,
 		)
 	case isWindows:
 		specOpts, err = c.buildWindowsSpec(
-			id,
 			sandboxID,
-			sandboxPid,
 			netNSPath,
 			containerName,
 			imageName,
@@ -576,7 +610,6 @@ func (c *criService) buildContainerSpec(
 		)
 	case isDarwin:
 		specOpts, err = c.buildDarwinSpec(
-			id,
 			sandboxID,
 			containerName,
 			imageName,
@@ -601,7 +634,6 @@ func (c *criService) buildLinuxSpec(
 	id string,
 	sandboxID string,
 	sandboxPid uint32,
-	netNSPath string,
 	containerName string,
 	imageName string,
 	config *runtime.ContainerConfig,
@@ -609,6 +641,7 @@ func (c *criService) buildLinuxSpec(
 	imageConfig *imagespec.ImageConfig,
 	extraMounts []*runtime.Mount,
 	ociRuntime criconfig.Runtime,
+	runtimeHandler *runtime.RuntimeHandler,
 ) (_ []oci.SpecOpts, retErr error) {
 	specOpts := []oci.SpecOpts{
 		oci.WithoutRunMount,
@@ -683,7 +716,14 @@ func (c *criService) buildLinuxSpec(
 		}
 	}()
 
-	specOpts = append(specOpts, customopts.WithMounts(c.os, config, extraMounts, mountLabel))
+	var ociSpecOpts oci.SpecOpts
+	if ociRuntime.CgroupWritable {
+		ociSpecOpts = customopts.WithMountsCgroupWritable(c.os, config, extraMounts, mountLabel, runtimeHandler)
+	} else {
+		ociSpecOpts = customopts.WithMounts(c.os, config, extraMounts, mountLabel, runtimeHandler)
+	}
+
+	specOpts = append(specOpts, ociSpecOpts)
 
 	if !c.config.DisableProcMount {
 		// Change the default masked/readonly paths to empty slices
@@ -738,14 +778,10 @@ func (c *criService) buildLinuxSpec(
 		specOpts = append(specOpts, oci.WithRootFSReadonly())
 	}
 
-	if c.config.DisableCgroup {
-		specOpts = append(specOpts, customopts.WithDisabledCgroups)
-	} else {
-		specOpts = append(specOpts, customopts.WithResources(config.GetLinux().GetResources(), c.config.TolerateMissingHugetlbController, c.config.DisableHugetlbController))
-		if sandboxConfig.GetLinux().GetCgroupParent() != "" {
-			cgroupsPath := getCgroupsPath(sandboxConfig.GetLinux().GetCgroupParent(), id)
-			specOpts = append(specOpts, oci.WithCgroup(cgroupsPath))
-		}
+	specOpts = append(specOpts, customopts.WithResources(config.GetLinux().GetResources(), c.config.TolerateMissingHugetlbController, c.config.DisableHugetlbController))
+	if sandboxConfig.GetLinux().GetCgroupParent() != "" {
+		cgroupsPath := getCgroupsPath(sandboxConfig.GetLinux().GetCgroupParent(), id)
+		specOpts = append(specOpts, oci.WithCgroup(cgroupsPath))
 	}
 
 	supplementalGroups := securityContext.GetSupplementalGroups()
@@ -772,12 +808,12 @@ func (c *criService) buildLinuxSpec(
 		specOpts = append(specOpts, oci.WithRdt(rdtClass, "", ""))
 	}
 
-	for pKey, pValue := range getPassthroughAnnotations(sandboxConfig.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(sandboxConfig.Annotations,
 		ociRuntime.PodAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
 
-	for pKey, pValue := range getPassthroughAnnotations(config.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(config.Annotations,
 		ociRuntime.ContainerAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
@@ -830,9 +866,7 @@ func (c *criService) buildLinuxSpec(
 }
 
 func (c *criService) buildWindowsSpec(
-	id string,
 	sandboxID string,
-	sandboxPid uint32,
 	netNSPath string,
 	containerName string,
 	imageName string,
@@ -858,6 +892,8 @@ func (c *criService) buildWindowsSpec(
 		specOpts = append(specOpts, oci.WithProcessCwd(config.GetWorkingDir()))
 	} else if imageConfig.WorkingDir != "" {
 		specOpts = append(specOpts, oci.WithProcessCwd(imageConfig.WorkingDir))
+	} else if cntrHpc {
+		specOpts = append(specOpts, oci.WithProcessCwd(`C:\hpc`))
 	}
 
 	if config.GetTty() {
@@ -907,12 +943,12 @@ func (c *criService) buildWindowsSpec(
 	// when trying to run the init process.
 	specOpts = append(specOpts, oci.WithUser(username))
 
-	for pKey, pValue := range getPassthroughAnnotations(sandboxConfig.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(sandboxConfig.Annotations,
 		ociRuntime.PodAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
 
-	for pKey, pValue := range getPassthroughAnnotations(config.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(config.Annotations,
 		ociRuntime.ContainerAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
@@ -926,7 +962,6 @@ func (c *criService) buildWindowsSpec(
 }
 
 func (c *criService) buildDarwinSpec(
-	id string,
 	sandboxID string,
 	containerName string,
 	imageName string,
@@ -960,12 +995,12 @@ func (c *criService) buildDarwinSpec(
 
 	specOpts = append(specOpts, customopts.WithDarwinMounts(c.os, config, extraMounts))
 
-	for pKey, pValue := range getPassthroughAnnotations(sandboxConfig.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(sandboxConfig.Annotations,
 		ociRuntime.PodAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
 
-	for pKey, pValue := range getPassthroughAnnotations(config.Annotations,
+	for pKey, pValue := range util.GetPassthroughAnnotations(config.Annotations,
 		ociRuntime.ContainerAnnotations) {
 		specOpts = append(specOpts, customopts.WithAnnotation(pKey, pValue))
 	}
@@ -1008,27 +1043,37 @@ func (c *criService) linuxContainerMounts(sandboxID string, config *runtime.Cont
 	}
 
 	if !isInCRIMounts(etcHosts, config.GetMounts()) {
-		mounts = append(mounts, &runtime.Mount{
-			ContainerPath:  etcHosts,
-			HostPath:       c.getSandboxHosts(sandboxID),
-			Readonly:       securityContext.GetReadonlyRootfs(),
-			SelinuxRelabel: true,
-			UidMappings:    uidMappings,
-			GidMappings:    gidMappings,
-		})
+		hostpath := c.getSandboxHosts(sandboxID)
+		// /etc/hosts could be delegated to remote sandbox controller. That file isn't required to be existed
+		// in host side for some sandbox runtimes. Skip it if we don't need it.
+		if _, err := c.os.Stat(hostpath); err == nil {
+			mounts = append(mounts, &runtime.Mount{
+				ContainerPath:  etcHosts,
+				HostPath:       hostpath,
+				Readonly:       securityContext.GetReadonlyRootfs(),
+				SelinuxRelabel: true,
+				UidMappings:    uidMappings,
+				GidMappings:    gidMappings,
+			})
+		}
 	}
 
 	// Mount sandbox resolv.config.
 	// TODO: Need to figure out whether we should always mount it as read-only
 	if !isInCRIMounts(resolvConfPath, config.GetMounts()) {
-		mounts = append(mounts, &runtime.Mount{
-			ContainerPath:  resolvConfPath,
-			HostPath:       c.getResolvPath(sandboxID),
-			Readonly:       securityContext.GetReadonlyRootfs(),
-			SelinuxRelabel: true,
-			UidMappings:    uidMappings,
-			GidMappings:    gidMappings,
-		})
+		hostpath := c.getResolvPath(sandboxID)
+		// The ownership of /etc/resolv.conf could be delegated to remote sandbox controller. That file isn't
+		// required to be existed in host side for some sandbox runtimes. Skip it if we don't need it.
+		if _, err := c.os.Stat(hostpath); err == nil {
+			mounts = append(mounts, &runtime.Mount{
+				ContainerPath:  resolvConfPath,
+				HostPath:       hostpath,
+				Readonly:       securityContext.GetReadonlyRootfs(),
+				SelinuxRelabel: true,
+				UidMappings:    uidMappings,
+				GidMappings:    gidMappings,
+			})
+		}
 	}
 
 	if !isInCRIMounts(devShm, config.GetMounts()) {
@@ -1036,23 +1081,27 @@ func (c *criService) linuxContainerMounts(sandboxID string, config *runtime.Cont
 		if securityContext.GetNamespaceOptions().GetIpc() == runtime.NamespaceMode_NODE {
 			sandboxDevShm = devShm
 		}
-		mounts = append(mounts, &runtime.Mount{
-			ContainerPath:  devShm,
-			HostPath:       sandboxDevShm,
-			Readonly:       false,
-			SelinuxRelabel: sandboxDevShm != devShm,
-			// XXX: tmpfs support for idmap mounts got merged in
-			// Linux 6.3.
-			// Our Ubuntu 22.04 CI runs with 5.15 kernels, so
-			// disabling idmap mounts for this case makes the CI
-			// happy (the other fs used support idmap mounts in 5.15
-			// kernels).
-			// We can enable this at a later stage, but as this
-			// tmpfs mount is exposed empty to the container (no
-			// prepopulated files) and using the hostIPC with userns
-			// is blocked by k8s, we can just avoid using the
-			// mappings and it should work fine.
-		})
+		// The ownership of /dev/shm could be delegated to remote sandbox controller. That file isn't required
+		// to be existed in host side for some sandbox runtimes. Skip it if we don't need it.
+		if _, err := c.os.Stat(sandboxDevShm); err == nil {
+			mounts = append(mounts, &runtime.Mount{
+				ContainerPath:  devShm,
+				HostPath:       sandboxDevShm,
+				Readonly:       false,
+				SelinuxRelabel: sandboxDevShm != devShm,
+				// XXX: tmpfs support for idmap mounts got merged in
+				// Linux 6.3.
+				// Our Ubuntu 22.04 CI runs with 5.15 kernels, so
+				// disabling idmap mounts for this case makes the CI
+				// happy (the other fs used support idmap mounts in 5.15
+				// kernels).
+				// We can enable this at a later stage, but as this
+				// tmpfs mount is exposed empty to the container (no
+				// prepopulated files) and using the hostIPC with userns
+				// is blocked by k8s, we can just avoid using the
+				// mappings and it should work fine.
+			})
+		}
 	}
 	return mounts
 }

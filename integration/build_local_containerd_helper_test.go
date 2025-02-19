@@ -34,12 +34,13 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/opencontainers/go-digest"
 
+	_ "github.com/containerd/containerd/api/types/runc/options"
 	_ "github.com/containerd/containerd/v2/core/runtime/v2"
-	_ "github.com/containerd/containerd/v2/core/runtime/v2/runc/options"
-	_ "github.com/containerd/containerd/v2/pkg/events/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/content/local/plugin"
 	_ "github.com/containerd/containerd/v2/plugins/cri/images"
 	_ "github.com/containerd/containerd/v2/plugins/cri/runtime"
 	_ "github.com/containerd/containerd/v2/plugins/diff/walking/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/events"
 	_ "github.com/containerd/containerd/v2/plugins/gc"
 	_ "github.com/containerd/containerd/v2/plugins/leases"
 	_ "github.com/containerd/containerd/v2/plugins/metadata"
@@ -129,7 +130,6 @@ func buildLocalContainerdClient(t *testing.T, tmpDir string, tweakInitFn tweakPl
 		containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
 		containerd.WithDefaultPlatform(platforms.Default()),
 		containerd.WithInMemoryServices(lastInitContext),
-		containerd.WithInMemorySandboxControllers(lastInitContext),
 	)
 	require.NoError(t, err)
 

@@ -25,16 +25,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd/v2/core/content"
-	"github.com/containerd/containerd/v2/core/metadata/boltutil"
-	"github.com/containerd/containerd/v2/pkg/filters"
-	"github.com/containerd/containerd/v2/pkg/labels"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
+	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/metadata/boltutil"
+	"github.com/containerd/containerd/v2/pkg/filters"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 type contentStore struct {
@@ -208,7 +210,7 @@ func (cs *contentStore) Delete(ctx context.Context, dgst digest.Digest) error {
 	cs.l.RLock()
 	defer cs.l.RUnlock()
 
-	return update(ctx, cs.db, func(tx *bolt.Tx) error {
+	if err := update(ctx, cs.db, func(tx *bolt.Tx) error {
 		bkt := getBlobBucket(tx, ns, dgst)
 		if bkt == nil {
 			return fmt.Errorf("content digest %v: %w", dgst, errdefs.ErrNotFound)
@@ -226,7 +228,18 @@ func (cs *contentStore) Delete(ctx context.Context, dgst digest.Digest) error {
 		cs.db.dirtyCS = true
 
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	if publisher := cs.db.Publisher(ctx); publisher != nil {
+		if err := publisher.Publish(ctx, "/content/delete", &eventstypes.ContentDelete{
+			Digest: dgst.String(),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (cs *contentStore) ListStatuses(ctx context.Context, fs ...string) ([]content.Status, error) {
@@ -487,7 +500,7 @@ type namespacedWriter struct {
 	ctx       context.Context
 	ref       string
 	namespace string
-	db        transactor
+	db        Transactor
 	provider  interface {
 		content.Provider
 		content.Ingester
@@ -574,6 +587,18 @@ func (nw *namespacedWriter) Commit(ctx context.Context, size int64, expected dig
 
 	var innerErr error
 
+	// We pre-sync the in-flight writes to the disk. This avoids the
+	// subsequent fp.Sync() call[1]	from taking too long (10s+) while
+	// holding the metadata database lock as in the following `update`
+	// transaction.
+	//
+	// REF:
+	// [1]: https://github.com/containerd/containerd/blob/c4c3c6ea568ce0cfbcf754863abadeea37d77c8f/plugins/content/local/writer.go#L95
+	if err := nw.Sync(); err != nil {
+		nw.Close()
+		return fmt.Errorf("failed to perform sync: %w", err)
+	}
+
 	if err := update(ctx, nw.db, func(tx *bolt.Tx) error {
 		dgst, err := nw.commit(ctx, tx, size, expected, opts...)
 		if err != nil {
@@ -597,6 +622,13 @@ func (nw *namespacedWriter) Commit(ctx context.Context, size int64, expected dig
 	}
 
 	return innerErr
+}
+
+func (nw *namespacedWriter) Sync() error {
+	if syncer, ok := nw.w.(content.Syncer); ok {
+		return syncer.Sync()
+	}
+	return nil
 }
 
 func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64, expected digest.Digest, opts ...content.Opt) (digest.Digest, error) {

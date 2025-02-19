@@ -19,18 +19,23 @@ package server
 import (
 	"fmt"
 
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/selinux/go-selinux"
 	"tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/containerd/containerd/v2/pkg/cap"
-	"github.com/containerd/containerd/v2/pkg/userns"
+	"github.com/containerd/containerd/v2/pkg/kernelversion"
 	"github.com/containerd/go-cni"
 	"github.com/containerd/log"
 )
 
-// networkAttachCount is the minimum number of networks the PodSandbox
-// attaches to
-const networkAttachCount = 2
+func init() {
+	var err error
+	kernelSupportsRRO, err = kernelversion.GreaterEqualThan(kernelversion.KernelVersion{Kernel: 5, Major: 12})
+	if err != nil {
+		panic(fmt.Errorf("failed to check kernel version: %w", err))
+	}
+}
 
 // initPlatform handles linux specific initialization for the CRI service.
 func (c *criService) initPlatform() (err error) {
@@ -60,6 +65,12 @@ func (c *criService) initPlatform() (err error) {
 		}
 	}
 
+	networkAttachCount := 2
+
+	if c.Config().UseInternalLoopback {
+		networkAttachCount = 1
+	}
+
 	c.netPlugin = make(map[string]cni.CNI)
 	for name, dir := range pluginDirs {
 		max := c.config.NetworkPluginMaxConfNum
@@ -69,9 +80,10 @@ func (c *criService) initPlatform() (err error) {
 			}
 		}
 		// Pod needs to attach to at least loopback network and a non host network,
-		// hence networkAttachCount is 2. If there are more network configs the
-		// pod will be attached to all the networks but we will only use the ip
-		// of the default network interface as the pod IP.
+		// hence networkAttachCount is 2 if the CNI plugin is used and
+		// 1 if the internal mechanism for setting lo to up is used.
+		// If there are more network configs the pod will be attached to all the networks
+		// but we will only use the ip of the default network interface as the pod IP.
 		i, err := cni.New(cni.WithMinNetworkCount(networkAttachCount),
 			cni.WithPluginConfDir(dir),
 			cni.WithPluginMaxConfNum(max),
@@ -90,8 +102,7 @@ func (c *criService) initPlatform() (err error) {
 	}
 
 	if c.config.EnableCDI {
-		reg := cdi.GetRegistry()
-		err = reg.Configure(cdi.WithSpecDirs(c.config.CDISpecDirs...))
+		err := cdi.Configure(cdi.WithSpecDirs(c.config.CDISpecDirs...))
 		if err != nil {
 			return fmt.Errorf("failed to configure CDI registry")
 		}
@@ -102,5 +113,9 @@ func (c *criService) initPlatform() (err error) {
 
 // cniLoadOptions returns cni load options for the linux.
 func (c *criService) cniLoadOptions() []cni.Opt {
+	if c.config.UseInternalLoopback {
+		return []cni.Opt{cni.WithDefaultConf}
+	}
+
 	return []cni.Opt{cni.WithLoNetwork, cni.WithDefaultConf}
 }

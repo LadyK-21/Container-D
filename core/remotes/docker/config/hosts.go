@@ -28,13 +28,13 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/pelletier/go-toml/v2"
 	tomlu "github.com/pelletier/go-toml/v2/unstable"
+
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 )
 
 // UpdateClientFunc is a function that lets you to amend http Client behavior used by registry clients.
@@ -143,19 +143,7 @@ func ConfigureHosts(ctx context.Context, options HostOptions) docker.RegistryHos
 			defaultTLSConfig = &tls.Config{}
 		}
 
-		defaultTransport := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:       30 * time.Second,
-				KeepAlive:     30 * time.Second,
-				FallbackDelay: 300 * time.Millisecond,
-			}).DialContext,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       30 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			TLSClientConfig:       defaultTLSConfig,
-			ExpectContinueTimeout: 5 * time.Second,
-		}
+		defaultTransport := docker.DefaultHTTPTransport(defaultTLSConfig)
 
 		client := &http.Client{
 			Transport: defaultTransport,
@@ -244,16 +232,16 @@ func ConfigureHosts(ctx context.Context, options HostOptions) docker.RegistryHos
 
 			// When TLS has been configured for the operation or host and
 			// the protocol from the port number is ambiguous, use the
-			// docker.HTTPFallback roundtripper to catch TLS errors and re-attempt the
+			// docker.NewHTTPFallback roundtripper to catch TLS errors and re-attempt the
 			// request as http. This allows preference for https when configured but
 			// also catches TLS errors early enough in the request to avoid sending
 			// the request twice or consuming the request body.
 			if host.scheme == "http" && explicitTLS {
 				_, port, _ := net.SplitHostPort(host.host)
-				if port != "" && port != "80" {
+				if port != "80" {
 					log.G(ctx).WithField("host", host.host).Info("host will try HTTPS first since it is configured for HTTP with a TLS configuration, consider changing host to HTTPS or removing unused TLS configuration")
 					host.scheme = "https"
-					rhosts[i].Client.Transport = docker.HTTPFallback{RoundTripper: rhosts[i].Client.Transport}
+					rhosts[i].Client.Transport = docker.NewHTTPFallback(rhosts[i].Client.Transport)
 				}
 			}
 
@@ -308,7 +296,7 @@ func loadHostDir(ctx context.Context, hostsDir string) ([]hostConfig, error) {
 
 	hosts, err := parseHostsFile(hostsDir, b)
 	if err != nil {
-		log.G(ctx).WithError(err).Error("failed to decode hosts.toml")
+		log.G(ctx).WithError(err).Errorf("failed to decode %s", filepath.Join(hostsDir, "hosts.toml"))
 		// Fallback to checking certificate files
 		return loadCertFiles(ctx, hostsDir)
 	}

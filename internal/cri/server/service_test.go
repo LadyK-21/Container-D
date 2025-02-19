@@ -19,10 +19,13 @@ package server
 import (
 	"context"
 
+	"github.com/containerd/errdefs"
 	"github.com/containerd/go-cni"
-	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"github.com/containerd/platforms"
+	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/containerd/containerd/v2/api/types"
+	"github.com/containerd/containerd/api/types"
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/sandbox"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
@@ -32,13 +35,39 @@ import (
 	"github.com/containerd/containerd/v2/internal/registrar"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	ostesting "github.com/containerd/containerd/v2/pkg/os/testing"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/platforms"
 )
 
 type fakeSandboxService struct{}
 
-func (f *fakeSandboxService) SandboxController(config *runtime.PodSandboxConfig, runtimeHandler string) (sandbox.Controller, error) {
+func (f *fakeSandboxService) CreateSandbox(ctx context.Context, info sandbox.Sandbox, opts ...sandbox.CreateOpt) error {
+	return errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) StartSandbox(ctx context.Context, sandboxer string, sandboxID string) (sandbox.ControllerInstance, error) {
+	return sandbox.ControllerInstance{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) StopSandbox(ctx context.Context, sandboxer, sandboxID string, opts ...sandbox.StopOpt) error {
+	return errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) ShutdownSandbox(ctx context.Context, sandboxer string, sandboxID string) error {
+	return errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) WaitSandbox(ctx context.Context, sandboxer string, sandboxID string) (<-chan containerd.ExitStatus, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) SandboxStatus(ctx context.Context, sandboxer string, sandboxID string, verbose bool) (sandbox.ControllerStatus, error) {
+	return sandbox.ControllerStatus{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxService) SandboxPlatform(ctx context.Context, sandboxer string, sandboxID string) (imagespec.Platform, error) {
+	return platforms.DefaultSpec(), nil
+}
+
+func (f *fakeSandboxService) SandboxController(sandboxer string) (sandbox.Controller, error) {
 	return &fakeSandboxController{}, nil
 }
 
@@ -52,7 +81,7 @@ func (f fakeSandboxController) Start(ctx context.Context, sandboxID string) (san
 	return sandbox.ControllerInstance{}, errdefs.ErrNotImplemented
 }
 
-func (f fakeSandboxController) Platform(_ctx context.Context, _sandboxID string) (platforms.Platform, error) {
+func (f fakeSandboxController) Platform(_ctx context.Context, _sandboxID string) (imagespec.Platform, error) {
 	return platforms.DefaultSpec(), nil
 }
 
@@ -74,6 +103,14 @@ func (f fakeSandboxController) Shutdown(ctx context.Context, sandboxID string) e
 
 func (f fakeSandboxController) Metrics(ctx context.Context, sandboxID string) (*types.Metric, error) {
 	return &types.Metric{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSandboxController) Update(
+	ctx context.Context,
+	sandboxID string,
+	sandbox sandbox.Sandbox,
+	fields ...string) error {
+	return errdefs.ErrNotImplemented
 }
 
 type fakeRuntimeService struct {

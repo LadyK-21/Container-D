@@ -23,10 +23,11 @@ import (
 	"syscall"
 	"time"
 
-	eventtypes "github.com/containerd/containerd/v2/api/events"
+	eventtypes "github.com/containerd/containerd/api/events"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
-	"github.com/containerd/containerd/v2/protobuf"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
@@ -36,13 +37,21 @@ import (
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
 func (c *criService) StopContainer(ctx context.Context, r *runtime.StopContainerRequest) (*runtime.StopContainerResponse, error) {
+	span := tracing.SpanFromContext(ctx)
 	start := time.Now()
 	// Get container config from container store.
 	container, err := c.containerStore.Get(r.GetContainerId())
 	if err != nil {
-		return nil, fmt.Errorf("an error occurred when try to find container %q: %w", r.GetContainerId(), err)
-	}
+		if !errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("an error occurred when try to find container %q: %w", r.GetContainerId(), err)
+		}
 
+		// The StopContainer RPC is idempotent, and must not return an error if
+		// the container has already been stopped. Ref:
+		// https://github.com/kubernetes/cri-api/blob/c20fa40/pkg/apis/runtime/v1/api.proto#L67-L68
+		return &runtime.StopContainerResponse{}, nil
+	}
+	span.SetAttributes(tracing.Attribute("container.id", container.ID))
 	if err := c.stopContainer(ctx, container, time.Duration(r.GetTimeout())*time.Second); err != nil {
 		return nil, err
 	}
@@ -69,6 +78,8 @@ func (c *criService) StopContainer(ctx context.Context, r *runtime.StopContainer
 
 // stopContainer stops a container based on the container metadata.
 func (c *criService) stopContainer(ctx context.Context, container containerstore.Container, timeout time.Duration) error {
+	span := tracing.SpanFromContext(ctx)
+	start := time.Now()
 	id := container.ID
 	sandboxID := container.SandboxID
 
@@ -89,7 +100,7 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 		}
 		// Don't return for unknown state, some cleanup needs to be done.
 		if state == runtime.ContainerState_CONTAINER_UNKNOWN {
-			return cleanupUnknownContainer(ctx, id, container, sandboxID, c)
+			return c.cleanupUnknownContainer(ctx, id, container, sandboxID)
 		}
 		return nil
 	}
@@ -104,11 +115,11 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 			if !errdefs.IsNotFound(err) {
 				return fmt.Errorf("failed to wait for task for %q: %w", id, err)
 			}
-			return cleanupUnknownContainer(ctx, id, container, sandboxID, c)
+			return c.cleanupUnknownContainer(ctx, id, container, sandboxID)
 		}
 
 		exitCtx, exitCancel := context.WithCancel(context.Background())
-		stopCh := c.eventMonitor.startContainerExitMonitor(exitCtx, id, task.Pid(), exitCh)
+		stopCh := c.startContainerExitMonitor(exitCtx, id, task.Pid(), exitCh)
 		defer func() {
 			exitCancel()
 			// This ensures that exit monitor is stopped before
@@ -192,6 +203,12 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 	if err != nil {
 		return fmt.Errorf("an error occurs during waiting for container %q to be killed: %w", id, err)
 	}
+
+	span.AddEvent("container stopped",
+		tracing.Attribute("container.id", id),
+		tracing.Attribute("container.stop.duration", time.Since(start).String()),
+	)
+
 	return nil
 }
 
@@ -207,13 +224,13 @@ func (c *criService) waitContainerStop(ctx context.Context, container containers
 }
 
 // cleanupUnknownContainer cleanup stopped container in unknown state.
-func cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore.Container, sandboxID string, c *criService) error {
+func (c *criService) cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore.Container, sandboxID string) error {
 	// Reuse handleContainerExit to do the cleanup.
-	return handleContainerExit(ctx, &eventtypes.TaskExit{
+	return c.handleContainerExit(ctx, &eventtypes.TaskExit{
 		ContainerID: id,
 		ID:          id,
 		Pid:         0,
 		ExitStatus:  unknownExitCode,
 		ExitedAt:    protobuf.ToTimestamp(time.Now()),
-	}, cntr, sandboxID, c)
+	}, cntr, sandboxID)
 }

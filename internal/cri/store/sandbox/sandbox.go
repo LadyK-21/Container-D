@@ -37,6 +37,8 @@ type Sandbox struct {
 	Status StatusStorage
 	// Container is the containerd sandbox container client.
 	Container containerd.Container
+	// Sandboxer is the sandbox controller name of the sandbox
+	Sandboxer string
 	// CNI network namespace client.
 	// For hostnetwork pod, this is always nil;
 	// For non hostnetwork pod, this should never be nil.
@@ -45,6 +47,17 @@ type Sandbox struct {
 	*store.StopCh
 	// Stats contains (mutable) stats for the (pause) sandbox container
 	Stats *stats.ContainerStats
+	// Endpoint is the sandbox endpoint, for task or streaming api connection
+	Endpoint Endpoint
+}
+
+type Endpoint struct {
+	Address string
+	Version uint32
+}
+
+func (e *Endpoint) IsValid() bool {
+	return e.Address != ""
 }
 
 // NewSandbox creates an internally used sandbox type. This functions reminds

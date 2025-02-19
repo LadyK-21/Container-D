@@ -29,10 +29,11 @@ import (
 	"k8s.io/kubelet/pkg/cri/streaming"
 
 	runhcsoptions "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
-	runcoptions "github.com/containerd/containerd/v2/core/runtime/v2/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
+	"github.com/containerd/containerd/v2/internal/cri/opts"
 	"github.com/containerd/containerd/v2/pkg/deprecation"
-	runtimeoptions "github.com/containerd/containerd/v2/pkg/runtimeoptions/v1"
 	"github.com/containerd/containerd/v2/plugins"
 )
 
@@ -70,7 +71,11 @@ const (
 	ModeShim SandboxControllerMode = "shim"
 	// DefaultSandboxImage is the default image to use for sandboxes when empty or
 	// for default configurations.
-	DefaultSandboxImage = "registry.k8s.io/pause:3.9"
+	DefaultSandboxImage = "registry.k8s.io/pause:3.10"
+	// IOTypeFifo is container io implemented by creating named pipe
+	IOTypeFifo = "fifo"
+	// IOTypeStreaming is container io implemented by connecting the streaming api to sandbox endpoint
+	IOTypeStreaming = "streaming"
 )
 
 // Runtime struct to contain the type(ID), engine, and root variables for a default runtime
@@ -98,6 +103,8 @@ type Runtime struct {
 	// to the runtime spec when the container when PrivilegedWithoutHostDevices is already enabled. Requires
 	// PrivilegedWithoutHostDevices to be enabled. Defaults to false.
 	PrivilegedWithoutHostDevicesAllDevicesAllowed bool `toml:"privileged_without_host_devices_all_devices_allowed" json:"privileged_without_host_devices_all_devices_allowed"`
+	// CgroupWritable enables writable cgroups in non-privileged containers
+	CgroupWritable bool `toml:"cgroup_writable" json:"cgroupWritable"`
 	// BaseRuntimeSpec is a json file with OCI spec to use as base spec that all container's will be created from.
 	BaseRuntimeSpec string `toml:"base_runtime_spec" json:"baseRuntimeSpec"`
 	// NetworkPluginConfDir is a directory containing the CNI network information for the runtime class.
@@ -116,6 +123,11 @@ type Runtime struct {
 	// shim - means use whatever Controller implementation provided by shim (e.g. use RemoteController).
 	// podsandbox - means use Controller implementation from sbserver podsandbox package.
 	Sandboxer string `toml:"sandboxer" json:"sandboxer"`
+	// IOType defines how containerd transfer the io streams of the container
+	// if it is not set, the named pipe will be created for the container
+	// we can also set it to "streaming" to create a stream by streaming api,
+	// and use it as a channel to transfer the io stream
+	IOType string `toml:"io_type" json:"io_type"`
 }
 
 // ContainerdConfig contains toml config related to containerd
@@ -176,6 +188,8 @@ type CniConfig struct {
 	// * ipv6 - select the first ipv6 address
 	// * cni - use the order returned by the CNI plugins, returning the first IP address from the results
 	IPPreference string `toml:"ip_pref" json:"ipPref"`
+	// UseInternalLoopback specifies if we use the CNI loopback plugin or internal mechanism to set lo to up
+	UseInternalLoopback bool `toml:"use_internal_loopback" json:"useInternalLoopback"`
 }
 
 // Mirror contains the config related to the registry mirror
@@ -209,15 +223,18 @@ type Registry struct {
 	ConfigPath string `toml:"config_path" json:"configPath"`
 	// Mirrors are namespace to mirror mapping for all namespaces.
 	// This option will not be used when ConfigPath is provided.
-	// DEPRECATED: Use ConfigPath instead. Remove in containerd 2.0.
+	// DEPRECATED: Use ConfigPath instead. Remove in containerd 2.1.
+	// Supported in 1.x releases.
 	Mirrors map[string]Mirror `toml:"mirrors" json:"mirrors"`
 	// Configs are configs for each registry.
 	// The key is the domain name or IP of the registry.
-	// DEPRECATED: Use ConfigPath instead.
+	// DEPRECATED: Use ConfigPath instead. Remove in containerd 2.1.
+	// Supported in 1.x releases.
 	Configs map[string]RegistryConfig `toml:"configs" json:"configs"`
 	// Auths are registry endpoint to auth config mapping. The registry endpoint must
 	// be a valid url with host specified.
-	// DEPRECATED: Use ConfigPath instead. Remove in containerd 2.0, supported in 1.x releases.
+	// DEPRECATED: Use ConfigPath instead. Remove in containerd 2.1.
+	// Supported in 1.x releases.
 	Auths map[string]AuthConfig `toml:"auths" json:"auths"`
 	// Headers adds additional HTTP headers that get sent to all registries
 	Headers map[string][]string `toml:"headers" json:"headers"`
@@ -273,11 +290,11 @@ type ImageConfig struct {
 	// by other plugins to lookup the current image name.
 	// Image names should be full names including domain and tag
 	// Examples:
-	//   "sandbox": "k8s.gcr.io/pause:3.9"
+	//   "sandbox": "k8s.gcr.io/pause:3.10"
 	//   "base": "docker.io/library/ubuntu:latest"
 	// Migrated from:
 	// (PluginConfig).SandboxImage string `toml:"sandbox_image" json:"sandboxImage"`
-	PinnedImages map[string]string
+	PinnedImages map[string]string `toml:"pinned_images" json:"pinned_images"`
 
 	// RuntimePlatforms is map between the runtime and the image platform to
 	// use for that runtime. When resolving an image for a runtime, this
@@ -329,9 +346,6 @@ type RuntimeConfig struct {
 	// Log line longer than the limit will be split into multiple lines. Non-positive
 	// value means no limit.
 	MaxContainerLogLineSize int `toml:"max_container_log_line_size" json:"maxContainerLogSize"`
-	// DisableCgroup indicates to disable the cgroup support.
-	// This is useful when the containerd does not have permission to access cgroup.
-	DisableCgroup bool `toml:"disable_cgroup" json:"disableCgroup"`
 	// DisableApparmor indicates to disable the apparmor support.
 	// This is useful when the containerd does not have permission to access Apparmor.
 	DisableApparmor bool `toml:"disable_apparmor" json:"disableApparmor"`
@@ -476,7 +490,6 @@ func ValidateImageConfig(ctx context.Context, c *ImageConfig) ([]deprecation.War
 			c.Registry.Configs = make(map[string]RegistryConfig)
 		}
 		for endpoint, auth := range c.Registry.Auths {
-			auth := auth
 			u, err := url.Parse(endpoint)
 			if err != nil {
 				return warnings, fmt.Errorf("failed to parse registry url %q from `registry.auths`: %w", endpoint, err)
@@ -519,6 +532,10 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
 	}
 
 	for k, r := range c.ContainerdConfig.Runtimes {
+		if r.CgroupWritable && !opts.IsCgroup2UnifiedMode() {
+			return warnings, fmt.Errorf("runtime %s: `cgroup_writable` is only supported on cgroup v2", k)
+		}
+
 		if !r.PrivilegedWithoutHostDevices && r.PrivilegedWithoutHostDevicesAllDevicesAllowed {
 			return warnings, errors.New("`privileged_without_host_devices_all_devices_allowed` requires `privileged_without_host_devices` to be enabled")
 		}
@@ -526,6 +543,13 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
 		if len(r.Sandboxer) == 0 {
 			r.Sandboxer = string(ModePodSandbox)
 			c.ContainerdConfig.Runtimes[k] = r
+		}
+
+		if len(r.IOType) == 0 {
+			r.IOType = IOTypeFifo
+		}
+		if r.IOType != IOTypeStreaming && r.IOType != IOTypeFifo {
+			return warnings, errors.New("`io_type` can only be `streaming` or `named_pipe`")
 		}
 	}
 
